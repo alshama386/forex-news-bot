@@ -10,7 +10,10 @@ from telegram.constants import ParseMode
 # =========================
 # CONFIG
 # =========================
-TOKEN = "PUT_YOUR_TOKEN_HERE"
+import os
+TOKEN = os.environ.get("BOT_TOKEN")
+if not TOKEN:
+    raise Exception("BOT_TOKEN missing in Render environment variables")
 CHANNEL = "@newsforexq"
 SIGNATURE = "\n\n— @newsforexq"
 
