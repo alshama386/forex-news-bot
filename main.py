@@ -2,7 +2,7 @@ import os
 import time
 import sqlite3
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 
 import feedparser
 from telegram import Bot
@@ -130,7 +130,7 @@ def build_message(title, summary, link, urgent, src):
 📊 <b>قوة الخبر:</b> {التأثير}
 🧠 <b>اتجاه السوق:</b> {المزاج}
 📌 <b>الأصول المتأثرة:</b> {الأصول}
-🕰 {datetime.now().strftime('%Y-%m-%d %H:%M')}
+🕰 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}
 
 🔗 المصدر ({src}):
 {link}
