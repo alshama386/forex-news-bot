@@ -3,17 +3,13 @@ import time
 import sqlite3
 import hashlib
 from datetime import datetime, timezone
-
 import feedparser
 from telegram import Bot
 from telegram.constants import ParseMode
 
-# =====================
-# CONFIG
-# =====================
 TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL = "@news_forexq"
-SIGNATURE = "\n✈️ @news_forexq"
+SIGN = "\n✈️ @news_forexq"
 
 FEEDS = [
     "https://www.investing.com/rss/news_1.rss",
@@ -22,117 +18,72 @@ FEEDS = [
     "https://arab.dailyforex.com/rss/arab/forexnews.xml"
 ]
 
-POLL = 40
-MAX = 20
+KEYWORDS = {
+    "إيجابي": ["rise", "up", "bullish", "gain", "strong"],
+    "سلبي": ["fall", "down", "bearish", "loss", "weak"],
+}
 
-# =====================
-# DATABASE
-# =====================
+DB="posted.db"
+
 def db():
-    conn = sqlite3.connect("posted.db")
-    cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS posted (id TEXT PRIMARY KEY)")
-    conn.commit()
-    conn.close()
+    c=sqlite3.connect(DB)
+    c.execute("CREATE TABLE IF NOT EXISTS p(id TEXT PRIMARY KEY)")
+    c.commit();c.close()
 
-def exists(i):
-    conn = sqlite3.connect("posted.db")
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM posted WHERE id=?", (i,))
-    r = cur.fetchone()
-    conn.close()
-    return r is not None
+def seen(i):
+    c=sqlite3.connect(DB);r=c.execute("SELECT 1 FROM p WHERE id=?", (i,)).fetchone();c.close()
+    return r
 
-def save(i):
-    conn = sqlite3.connect("posted.db")
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO posted VALUES(?)", (i,))
-    conn.commit()
-    conn.close()
+def mark(i):
+    c=sqlite3.connect(DB);c.execute("INSERT OR IGNORE INTO p VALUES(?)",(i,));c.commit();c.close()
 
-# =====================
-# AI ANALYSIS (RULE BASED)
-# =====================
-def analyze(text):
-    t = text.lower()
+def mood(txt):
+    t=txt.lower()
+    for k,v in KEYWORDS.items():
+        if any(x in t for x in v): return k
+    return "محايد"
 
-    sentiment = "محايد"
-    if any(w in t for w in ["rise","gain","up","strong","bull","positive"]):
-        sentiment = "إيجابي"
-    if any(w in t for w in ["fall","drop","down","weak","bear","negative"]):
-        sentiment = "سلبي"
+def strength(txt):
+    t=txt.lower()
+    if any(x in t for x in ["rate","fed","powell","cpi","nfp","gold","oil"]): return "عالي جداً"
+    return "متوسط"
 
-    impact = "متوسط"
-    if any(w in t for w in ["fed","cpi","inflation","interest","nfp","rate"]):
-        impact = "عالي جدًا"
-    elif any(w in t for w in ["gold","usd","oil","eurusd"]):
-        impact = "عالي"
+def build(t,s,l,src):
+    m=mood(t+s)
+    st=strength(t+s)
+    warn="🟡 تحذير ذهبي" if st=="عالي جداً" else "—"
+    return f"""
+📰 <b>{t}</b>
 
-    asset = "عام"
-    if "gold" in t or "xau" in t:
-        asset = "الذهب"
-    elif "usd" in t:
-        asset = "الدولار"
-    elif "oil" in t:
-        asset = "النفط"
+📊 <b>قوة الخبر:</b> {st}
+🧠 <b>اتجاه السوق:</b> {m}
+🚨 <b>{warn}</b>
 
-    golden = "⚠️ تحذير ذهبي محتمل" if asset == "الذهب" else ""
+🔗 المصدر ({src})
+{l}
 
-    return sentiment, impact, asset, golden
-
-# =====================
-# FORMAT
-# =====================
-def build(title, summary, link, src):
-    s, i, a, g = analyze(title + " " + summary)
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-
-    msg = f"""
-<b>{title}</b>
-
-{summary[:240]}...
-
-━━━━━━━━━━━━━━
-📊 <b>قوة الخبر:</b> {i}
-🧠 <b>اتجاه السوق:</b> {s}
-🎯 <b>الأصول المتأثرة:</b> {a}
-{g}
-🕒 {now}
-🔗 <b>المصدر ({src})</b>
-{link}
-━━━━━━━━━━━━━━
-{SIGNATURE}
+🕒 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}
+{SIGN}
 """
-    return msg
 
-# =====================
-# MAIN
-# =====================
 def main():
     db()
-    bot = Bot(TOKEN)
-
+    bot=Bot(TOKEN)
     while True:
         for url in FEEDS:
-            feed = feedparser.parse(url)
-            src = "FX"
+            f=feedparser.parse(url)
+            src=url.split("//")[1].split("/")[0]
+            for e in f.entries[:20]:
+                t=e.get("title","")
+                l=e.get("link","")
+                s=e.get("summary","")
+                h=hashlib.md5((t+l).encode()).hexdigest()
+                if seen(h): continue
+                msg=build(t,s,l,src)
+                bot.send_message(CHANNEL,msg,parse_mode=ParseMode.HTML,disable_web_page_preview=False)
+                mark(h)
+                time.sleep(1)
+        time.sleep(30)
 
-            for e in feed.entries[:MAX]:
-                title = e.get("title","")
-                link = e.get("link","")
-                summary = e.get("summary","")
-
-                hid = hashlib.md5((title+link).encode()).hexdigest()
-                if exists(hid):
-                    continue
-
-                text = build(title, summary, link, src)
-                bot.send_message(CHANNEL, text, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
-
-                save(hid)
-                time.sleep(2)
-
-        time.sleep(POLL)
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
