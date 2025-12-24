@@ -1,9 +1,5 @@
-import os
-import time
-import sqlite3
-import hashlib
+import os, time, sqlite3, hashlib, asyncio, feedparser
 from datetime import datetime, timezone
-import feedparser
 from telegram import Bot
 from telegram.constants import ParseMode
 
@@ -17,98 +13,71 @@ FEEDS = [
     "https://arab.dailyforex.com/rss/arab/forexnews.xml"
 ]
 
-DB_FILE = "posted.db"
-POLL_SECONDS = 40
+DB = "posted.db"
 
-# ================= DB =================
 def init_db():
-    with sqlite3.connect(DB_FILE) as c:
-        c.execute("CREATE TABLE IF NOT EXISTS posted (id TEXT PRIMARY KEY)")
-        c.commit()
+    c = sqlite3.connect(DB)
+    c.execute("CREATE TABLE IF NOT EXISTS p (id TEXT PRIMARY KEY)")
+    c.close()
 
-def is_posted(i):
-    with sqlite3.connect(DB_FILE) as c:
-        return c.execute("SELECT 1 FROM posted WHERE id=?", (i,)).fetchone()
+def seen(i):
+    c = sqlite3.connect(DB)
+    r = c.execute("SELECT 1 FROM p WHERE id=?", (i,)).fetchone()
+    c.close()
+    return r
 
-def mark_posted(i):
-    with sqlite3.connect(DB_FILE) as c:
-        c.execute("INSERT OR IGNORE INTO posted VALUES(?)", (i,))
-        c.commit()
+def mark(i):
+    c = sqlite3.connect(DB)
+    c.execute("INSERT OR IGNORE INTO p VALUES(?)", (i,))
+    c.commit()
+    c.close()
 
-# ================= LOGIC =================
-def clean(t):
-    return " ".join((t or "").split())
+def h(t,l): return hashlib.md5((t+l).encode()).hexdigest()
 
-def hid(t,l):
-    return hashlib.md5((t+l).encode()).hexdigest()
-
-def impact(text):
+def analyze(text):
     t = text.lower()
-    if any(x in t for x in ["cpi","nfp","fed","interest","rate"]):
-        return "🔥 عالي جداً"
-    if any(x in t for x in ["gold","oil","usd","eur"]):
-        return "⚡ عالي"
-    return "🟡 متوسط"
+    if any(x in t for x in ["fed","powell","rate","inflation","cpi","nfp"]):
+        return "عالي جداً","⚠️ تحذير ذهبي","سلبي" if "inflation" in t else "إيجابي"
+    if any(x in t for x in ["gold","xau","oil","brent","wti"]):
+        return "قوي","تحذير","إيجابي"
+    return "متوسط","—","محايد"
 
-def mood(text):
-    t = text.lower()
-    if any(x in t for x in ["rise","up","bull"]):
-        return "🟢 إيجابي"
-    if any(x in t for x in ["fall","down","bear"]):
-        return "🔴 سلبي"
-    return "⚪ محايد"
-
-def asset(text):
-    t=text.lower()
-    if "gold" in t: return "الذهب"
-    if "oil" in t: return "النفط"
-    if "usd" in t: return "الدولار"
-    if "eur" in t: return "اليورو"
-    return "السوق العام"
-
-def build(t,s,l):
+def build(title,summary,link):
+    قوة,تحذير,مزاج = analyze(title+summary)
+    now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
     return f"""
-🚨 <b>{clean(t)}</b>
+<b>{title}</b>
 
-🧠 <b>الاتجاه:</b> {mood(t+s)}
-📊 <b>قوة الخبر:</b> {impact(t+s)}
-📌 <b>الأصل المتأثر:</b> {asset(t+s)}
+{summary[:240]}
 
-🕒 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC
+⚡ <b>قوة الخبر:</b> {قوة}
+🧠 <b>اتجاه السوق:</b> {مزاج}
+🚨 <b>{تحذير}</b>
 
-🔗 المصدر:
-{l}
+🕒 {now}
+🔗 {link}
 
-━━━━━━━━━━━━━━
-⚠️ <b>تحذير ذهبي:</b>
-تجنب الدخول قبل تأكيد الحركة
-
-✈️ @news_forexq
+— @news_forexq
 """
 
-# ================= MAIN =================
-def main():
+async def main():
     init_db()
     bot = Bot(TOKEN)
-    print("Bot Running...")
 
     while True:
-        try:
-            for f in FEEDS:
-                feed = feedparser.parse(f)
-                for e in feed.entries[:15]:
-                    t = clean(e.get("title",""))
-                    l = clean(e.get("link",""))
-                    if not t: continue
-                    i = hid(t,l)
-                    if is_posted(i): continue
-                    bot.send_message(CHANNEL, build(t,"",l), parse_mode=ParseMode.HTML, disable_web_page_preview=False)
-                    mark_posted(i)
-                    time.sleep(1.5)
-            time.sleep(POLL_SECONDS)
-        except Exception as ex:
-            print("ERR:", ex)
-            time.sleep(10)
+        for url in FEEDS:
+            feed = feedparser.parse(url)
+            for e in feed.entries[:15]:
+                t = e.get("title","")
+                l = e.get("link","")
+                s = e.get("summary","")
+                i = h(t,l)
+                if seen(i): continue
 
-if __name__ == "__main__":
-    main()
+                msg = build(t,s,l)
+                await bot.send_message(CHANNEL,msg,parse_mode=ParseMode.HTML,disable_web_page_preview=False)
+                mark(i)
+                await asyncio.sleep(1.2)
+        await asyncio.sleep(30)
+
+asyncio.run(main())
