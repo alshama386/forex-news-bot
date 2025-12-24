@@ -1,2 +1,5 @@
 python-telegram-bot==21.6
 feedparser
+deep-translator
+beautifulsoup4
+lxml
