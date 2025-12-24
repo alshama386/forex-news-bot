@@ -3,172 +3,99 @@ import time
 import sqlite3
 import hashlib
 from datetime import datetime, timezone
-
 import feedparser
 from telegram import Bot
 from telegram.constants import ParseMode
 
-# =========================
-# CONFIG
-# =========================
 TOKEN = os.environ.get("BOT_TOKEN")
-if not TOKEN:
-    raise Exception("BOT_TOKEN missing in environment variables (BOT_TOKEN).")
-
 CHANNEL = "@news_forexq"
-SIGNATURE = "\n\n— @news_forexq"
 
 FEEDS = [
     "https://www.investing.com/rss/news_1.rss",
     "https://ar.fxstreet.com/rss/news",
     "https://www.arabictrader.com/rss/news",
-    "https://arab.dailyforex.com/rss/arab/forexnews.xml",
+    "https://arab.dailyforex.com/rss/arab/forexnews.xml"
 ]
 
-URGENT_KEYWORDS = [
-    "breaking", "flash", "urgent", "عاجل",
-    "fed", "powell", "interest rate", "inflation", "cpi", "nfp",
-    "jobs report", "gold", "xau", "dollar", "usd",
-    "brent", "wti", "oil"
-]
+DB = "posted.db"
 
-POLL_SECONDS = 25
-MAX_PER_FEED = 25
-SUMMARY_MAX_CHARS = 260
-
-DB_FILE = "posted.db"
-
-# =========================
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS posted (id TEXT PRIMARY KEY, created_at TEXT)")
-    conn.commit()
-    conn.close()
+    c = sqlite3.connect(DB)
+    c.execute("CREATE TABLE IF NOT EXISTS posted(id TEXT PRIMARY KEY)")
+    c.commit()
+    c.close()
 
-def already_posted(item_id):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM posted WHERE id=?", (item_id,))
-    r = cur.fetchone()
-    conn.close()
+def posted(pid):
+    c = sqlite3.connect(DB)
+    r = c.execute("SELECT 1 FROM posted WHERE id=?", (pid,)).fetchone()
+    c.close()
     return r is not None
 
-def mark_posted(item_id):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO posted (id, created_at) VALUES (?, ?)",
-                (item_id, datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
+def mark(pid):
+    c = sqlite3.connect(DB)
+    c.execute("INSERT OR IGNORE INTO posted VALUES(?)", (pid,))
+    c.commit()
+    c.close()
 
-def clean(t):
-    return " ".join((t or "").replace("\n", " ").split()).strip()
+def clean(t): return " ".join(str(t).replace("\n"," ").split())
 
-def make_hash_id(title, link):
-    return hashlib.sha256((clean(title)+clean(link)).encode()).hexdigest()
+def hid(t,l):
+    return hashlib.sha1((t+l).encode()).hexdigest()
 
-def is_urgent(title, summary):
-    t = (title + " " + summary).lower()
-    return any(k in t for k in URGENT_KEYWORDS)
-
-# =========================
-def analyze_news(text):
+def mood(text):
     t = text.lower()
+    if any(x in t for x in ["rate hike","inflation","hawkish","tightening"]):
+        return "🔴 سلبي جداً","⚠️ عالي جداً"
+    if any(x in t for x in ["gold","safe haven","demand","bullish"]):
+        return "🟢 إيجابي","⬆️ عالي"
+    return "⚪ محايد","➡️ متوسط"
 
-    إيجابي = ["rise","surge","gain","strong","beat","rebound","up"]
-    سلبي = ["fall","drop","weak","miss","cut","down","slump","decline"]
-    عالي = ["fed","powell","interest rate","inflation","cpi","nfp","gdp","fomc"]
+def build(title,summary,link,src):
+    m,lvl = mood(title+summary)
+    warn = "🚨 تحذير ذهبي" if lvl=="⚠️ عالي جداً" else "🟡 مراقبة"
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
-    التأثير = "🟡 متوسط"
-    المزاج = "⚪ محايد"
+    return f"""
+<b>{title}</b>
 
-    if any(k in t for k in عالي):
-        التأثير = "🔴 عالي جداً"
-    if any(k in t for k in إيجابي):
-        المزاج = "🟢 إيجابي"
-    if any(k in t for k in سلبي):
-        المزاج = "🔴 سلبي"
+{summary[:280]}...
 
-    الأصول = []
-    if "gold" in t or "xau" in t or "ذهب" in t: الأصول.append("XAUUSD")
-    if "usd" in t or "dollar" in t or "الدولار" in t: الأصول.append("USD")
-    if "oil" in t or "brent" in t or "wti" in t or "نفط" in t: الأصول.append("OIL")
-    if "nasdaq" in t or "nas100" in t: الأصول.append("NAS100")
+{warn}
+📊 <b>قوة الخبر:</b> {lvl}
+🧠 <b>مزاج السوق:</b> {m}
+📌 <b>الأصول المتأثرة:</b> ذهب – دولار – يورو – نفط
 
-    return التأثير, المزاج, ", ".join(الأصول) if الأصول else "السوق العام"
-
-def source_label(url):
-    if "investing" in url: return "Investing"
-    if "fxstreet" in url: return "FXStreet"
-    if "arabictrader" in url: return "ArabicTrader"
-    if "dailyforex" in url: return "DailyForex"
-    return "Source"
-
-def build_message(title, summary, link, urgent, src):
-    title = clean(title)
-    summary = clean(summary)
-    summary = summary[:SUMMARY_MAX_CHARS] + ("..." if len(summary)>SUMMARY_MAX_CHARS else "")
-
-    التأثير, المزاج, الأصول = analyze_news(title + " " + summary)
-
-    header = "🚨 <b>خبر عاجل</b>\n" if urgent else "📰 <b>أخبار الفوركس</b>\n"
-
-    # Golden warning for very high impact news
-    golden_warning = ""
-    if التأثير == "🔴 عالي جداً":
-        golden_warning = "⚠️ <b>تحذير ذهبي:</b> توقع حركة قوية جداً في السوق خلال الدقائق القادمة.\n\n"
-
-    msg = f"""
-━━━━━━━━━━━━━━━━━━
-{header}
-🗞 <b>{title}</b>
-
-{summary}
-
-{golden_warning}━━━━━━━━━━━━━━━━━━
-📊 <b>قوة الخبر:</b> {التأثير}
-🧠 <b>اتجاه السوق:</b> {المزاج}
-📌 <b>الأصول المتأثرة:</b> {الأصول}
-🕰 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}
-
-🔗 المصدر ({src}):
+🕒 {now}
+🔗 المصدر: {src}
 {link}
-━━━━━━━━━━━━━━━━━━
-📡 @news_forexq
-"""
-    return msg
 
-# =========================
+✈️ @news_forexq
+"""
+
 def main():
     init_db()
-    bot = Bot(token=TOKEN)
+    bot = Bot(TOKEN)
 
     while True:
         try:
             for url in FEEDS:
                 feed = feedparser.parse(url)
-                src = source_label(url)
+                src = url.split("/")[2]
+                for e in feed.entries[:20]:
+                    t = clean(e.get("title",""))
+                    l = clean(e.get("link",""))
+                    s = clean(e.get("summary",""))
+                    if not t or not l: continue
+                    pid = hid(t,l)
+                    if posted(pid): continue
 
-                for e in feed.entries[:MAX_PER_FEED]:
-                    title = clean(e.get("title"))
-                    link = clean(e.get("link"))
-                    summary = clean(e.get("summary") or e.get("description") or "")
+                    bot.send_message(CHANNEL, build(t,s,l,src), parse_mode=ParseMode.HTML, disable_web_page_preview=False)
+                    mark(pid)
+                    time.sleep(1.5)
 
-                    if not title: continue
-                    uid = e.get("id") or make_hash_id(title, link)
-                    if already_posted(uid): continue
-
-                    urgent = is_urgent(title, summary)
-                    text = build_message(title, summary, link, urgent, src)
-
-                    bot.send_message(chat_id=CHANNEL, text=text, parse_mode=ParseMode.HTML)
-                    mark_posted(uid)
-                    time.sleep(1.2)
-
-            time.sleep(POLL_SECONDS)
+            time.sleep(40)
         except Exception as ex:
-            print("Error:", ex)
+            print(ex)
             time.sleep(10)
 
 if __name__ == "__main__":
