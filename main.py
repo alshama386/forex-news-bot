@@ -9,7 +9,6 @@ from telegram.constants import ParseMode
 
 TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL = "@news_forexq"
-SIGN = "\n✈️ @news_forexq"
 
 FEEDS = [
     "https://www.investing.com/rss/news_1.rss",
@@ -18,72 +17,98 @@ FEEDS = [
     "https://arab.dailyforex.com/rss/arab/forexnews.xml"
 ]
 
-KEYWORDS = {
-    "إيجابي": ["rise", "up", "bullish", "gain", "strong"],
-    "سلبي": ["fall", "down", "bearish", "loss", "weak"],
-}
+DB_FILE = "posted.db"
+POLL_SECONDS = 40
 
-DB="posted.db"
+# ================= DB =================
+def init_db():
+    with sqlite3.connect(DB_FILE) as c:
+        c.execute("CREATE TABLE IF NOT EXISTS posted (id TEXT PRIMARY KEY)")
+        c.commit()
 
-def db():
-    c=sqlite3.connect(DB)
-    c.execute("CREATE TABLE IF NOT EXISTS p(id TEXT PRIMARY KEY)")
-    c.commit();c.close()
+def is_posted(i):
+    with sqlite3.connect(DB_FILE) as c:
+        return c.execute("SELECT 1 FROM posted WHERE id=?", (i,)).fetchone()
 
-def seen(i):
-    c=sqlite3.connect(DB);r=c.execute("SELECT 1 FROM p WHERE id=?", (i,)).fetchone();c.close()
-    return r
+def mark_posted(i):
+    with sqlite3.connect(DB_FILE) as c:
+        c.execute("INSERT OR IGNORE INTO posted VALUES(?)", (i,))
+        c.commit()
 
-def mark(i):
-    c=sqlite3.connect(DB);c.execute("INSERT OR IGNORE INTO p VALUES(?)",(i,));c.commit();c.close()
+# ================= LOGIC =================
+def clean(t):
+    return " ".join((t or "").split())
 
-def mood(txt):
-    t=txt.lower()
-    for k,v in KEYWORDS.items():
-        if any(x in t for x in v): return k
-    return "محايد"
+def hid(t,l):
+    return hashlib.md5((t+l).encode()).hexdigest()
 
-def strength(txt):
-    t=txt.lower()
-    if any(x in t for x in ["rate","fed","powell","cpi","nfp","gold","oil"]): return "عالي جداً"
-    return "متوسط"
+def impact(text):
+    t = text.lower()
+    if any(x in t for x in ["cpi","nfp","fed","interest","rate"]):
+        return "🔥 عالي جداً"
+    if any(x in t for x in ["gold","oil","usd","eur"]):
+        return "⚡ عالي"
+    return "🟡 متوسط"
 
-def build(t,s,l,src):
-    m=mood(t+s)
-    st=strength(t+s)
-    warn="🟡 تحذير ذهبي" if st=="عالي جداً" else "—"
+def mood(text):
+    t = text.lower()
+    if any(x in t for x in ["rise","up","bull"]):
+        return "🟢 إيجابي"
+    if any(x in t for x in ["fall","down","bear"]):
+        return "🔴 سلبي"
+    return "⚪ محايد"
+
+def asset(text):
+    t=text.lower()
+    if "gold" in t: return "الذهب"
+    if "oil" in t: return "النفط"
+    if "usd" in t: return "الدولار"
+    if "eur" in t: return "اليورو"
+    return "السوق العام"
+
+def build(t,s,l):
     return f"""
-📰 <b>{t}</b>
+🚨 <b>{clean(t)}</b>
 
-📊 <b>قوة الخبر:</b> {st}
-🧠 <b>اتجاه السوق:</b> {m}
-🚨 <b>{warn}</b>
+🧠 <b>الاتجاه:</b> {mood(t+s)}
+📊 <b>قوة الخبر:</b> {impact(t+s)}
+📌 <b>الأصل المتأثر:</b> {asset(t+s)}
 
-🔗 المصدر ({src})
+🕒 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC
+
+🔗 المصدر:
 {l}
 
-🕒 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}
-{SIGN}
+━━━━━━━━━━━━━━
+⚠️ <b>تحذير ذهبي:</b>
+تجنب الدخول قبل تأكيد الحركة
+
+✈️ @news_forexq
 """
 
+# ================= MAIN =================
 def main():
-    db()
-    bot=Bot(TOKEN)
-    while True:
-        for url in FEEDS:
-            f=feedparser.parse(url)
-            src=url.split("//")[1].split("/")[0]
-            for e in f.entries[:20]:
-                t=e.get("title","")
-                l=e.get("link","")
-                s=e.get("summary","")
-                h=hashlib.md5((t+l).encode()).hexdigest()
-                if seen(h): continue
-                msg=build(t,s,l,src)
-                bot.send_message(CHANNEL,msg,parse_mode=ParseMode.HTML,disable_web_page_preview=False)
-                mark(h)
-                time.sleep(1)
-        time.sleep(30)
+    init_db()
+    bot = Bot(TOKEN)
+    print("Bot Running...")
 
-if __name__=="__main__":
+    while True:
+        try:
+            for f in FEEDS:
+                feed = feedparser.parse(f)
+                for e in feed.entries[:15]:
+                    t = clean(e.get("title",""))
+                    l = clean(e.get("link",""))
+                    if not t: continue
+                    i = hid(t,l)
+                    if is_posted(i): continue
+                    bot.send_message(CHANNEL, build(t,"",l), parse_mode=ParseMode.HTML, disable_web_page_preview=False)
+                    mark_posted(i)
+                    time.sleep(1.5)
+            time.sleep(POLL_SECONDS)
+        except Exception as ex:
+            print("ERR:", ex)
+            time.sleep(10)
+
+if __name__ == "__main__":
     main()
