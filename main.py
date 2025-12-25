@@ -13,199 +13,118 @@ from dateutil import parser as dtparser
 from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TimedOut, NetworkError
-from telegram.ext import Application, ApplicationBuilder
 
-# ---------------------------
-# CONFIG (Environment)
-# ---------------------------
+
+# =========================
+# ENV CONFIG
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # e.g. "@news_forexq" or "-100xxxxxxxxxx"
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # e.g. "@news_forexq" or "-100..."
 
-# RSS feeds: comma-separated
+# RSS feeds (comma-separated)
 # Example:
-# RSS_FEEDS="https://ar.fxstreet.com/rss/news,https://www.dailyforex.com/ar/rss"
+# RSS_FEEDS="https://ar.fxstreet.com/rss/news,https://www.investing.com/rss/news_1.rss,https://arab.dailyforex.com/rss/arab/forexnews.xml"
 RSS_FEEDS = [x.strip() for x in os.getenv("RSS_FEEDS", "").split(",") if x.strip()]
 
-# Arabic-only behavior:
 ARABIC_ONLY = os.getenv("ARABIC_ONLY", "true").lower() in ("1", "true", "yes", "y")
-
-# Try translating EN->AR for English headlines (optional).
 TRANSLATE_EN = os.getenv("TRANSLATE_EN", "false").lower() in ("1", "true", "yes", "y")
 
-# Polling interval seconds
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
+SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "3.0"))
 
-# Simple rate limiting (avoid Flood control)
-SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "3.5"))
-
-# Paths
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
-EVENTS_FILE = os.getenv("EVENTS_FILE", "events.json")
+EVENTS_FILE = os.getenv("EVENTS_FILE", "events.json")  # optional (calendar alerts)
 
-# ---------------------------
-# Logging
-# ---------------------------
+
+# =========================
+# LOGGING
+# =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("forex-news-bot")
 
-# ---------------------------
-# Helpers
-# ---------------------------
+
+# =========================
+# HELPERS
+# =========================
 ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
 URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+TAG_RE = re.compile(r"<[^>]+>")
+
+KUWAIT_TZ = timezone(timedelta(hours=3))
+
+
+def now_kw() -> datetime:
+    return datetime.now(KUWAIT_TZ)
+
+
+def fmt_dt(dt: datetime) -> str:
+    return dt.astimezone(KUWAIT_TZ).strftime("%Y-%m-%d %H:%M")
+
 
 def has_arabic(text: str) -> bool:
     return bool(ARABIC_RE.search(text or ""))
 
-def strip_links(text: str) -> str:
-    if not text:
-        return ""
-    return URL_RE.sub("", text).strip()
 
-def normalize_spaces(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "")).strip()
+def strip_links(text: str) -> str:
+    return URL_RE.sub("", text or "").strip()
+
+
+def strip_html(text: str) -> str:
+    return TAG_RE.sub(" ", text or "")
+
+
+def clean(text: str) -> str:
+    text = strip_html(text)
+    text = strip_links(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
 
 def short_hash(*parts: str) -> str:
-    h = hashlib.sha256(("|".join(parts)).encode("utf-8")).hexdigest()
+    h = hashlib.sha256(("|".join(parts)).encode("utf-8", errors="ignore")).hexdigest()
     return h[:16]
 
-def now_kuwait() -> datetime:
-    # Kuwait is UTC+3 (no DST typically)
-    return datetime.now(timezone(timedelta(hours=3)))
 
-def fmt_dt(dt: datetime) -> str:
-    # Example: 25 ديسمبر 2025 – 10:09
-    # We'll keep numbers (Telegram-friendly). If you want words, tell me.
-    return dt.strftime("%Y-%m-%d %H:%M")
+def source_name(entry: Any, feed_url: str) -> str:
+    # best-effort label without links
+    dom = feed_url.replace("https://", "").replace("http://", "").split("/")[0].lower()
 
-def guess_source(entry: Dict[str, Any], feed_url: str) -> str:
-    # Prefer feed title, then domain
-    src = ""
-    if "source" in entry and entry["source"]:
-        try:
-            src = entry["source"].get("title") or ""
-        except Exception:
-            pass
-    if not src:
-        # feedparser may store feed title separately; we pass fallback from URL
-        src = feed_url
-    # Clean to domain-ish name
-    src = src.replace("https://", "").replace("http://", "").split("/")[0]
-    # Make nicer
-    if "fxstreet" in src.lower():
+    if "fxstreet" in dom:
         return "FXStreet"
-    if "investing" in src.lower():
+    if "investing" in dom:
         return "Investing"
-    if "dailyforex" in src.lower():
+    if "dailyforex" in dom:
         return "DailyForex"
-    if "forexlive" in src.lower():
-        return "ForexLive"
-    if "dailyfx" in src.lower():
-        return "DailyFX"
-    return src[:40] if src else "مصدر"
+    if "arabictrader" in dom:
+        return "ArabicTrader"
 
-def detect_strength(text: str) -> str:
-    t = (text or "").lower()
-    # crude strength detection
-    strong_kw = ["high impact", "breaking", "urgent", "قوي", "قوية", "عاجل", "هام", "مهم", "تنبيه", "تدخل", "intervention"]
-    medium_kw = ["moderate", "متوسط", "متوسطة"]
-    low_kw = ["low impact", "منخفض", "منخفضة"]
+    return dom[:40] if dom else "مصدر"
 
-    if any(k in t for k in strong_kw):
-        return "عالي"
-    if any(k in t for k in medium_kw):
-        return "متوسط"
-    if any(k in t for k in low_kw):
-        return "منخفض"
-    return "متوسط"
 
-def detect_sentiment(text: str) -> str:
-    t = (text or "").lower()
-    pos_kw = ["rises", "rise", "up", "gains", "bull", "positive", "إيجابي", "ارتفاع", "يصعد", "تصعد", "مكاسب", "قوة"]
-    neg_kw = ["falls", "fall", "down", "drops", "bear", "negative", "سلبي", "هبوط", "ينخفض", "تراجع", "خسائر", "ضعف"]
-    if any(k in t for k in pos_kw):
-        return "إيجابي"
-    if any(k in t for k in neg_kw):
-        return "سلبي"
-    return "محايد"
+def parse_entry_time(entry: Any) -> datetime:
+    for key in ("published", "updated", "created"):
+        val = getattr(entry, key, None)
+        if val:
+            try:
+                dt = dtparser.parse(val)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(KUWAIT_TZ)
+            except Exception:
+                pass
+    return now_kw()
 
-def market_brain_icon(sentiment: str) -> str:
-    return "🧠"
 
-def sentiment_icon(sentiment: str) -> str:
-    if sentiment == "إيجابي":
-        return "✅"
-    if sentiment == "سلبي":
-        return "⛔"
-    return "⚪"
-
-def strength_icon(strength: str) -> str:
-    if strength == "عالي":
-        return "🔥"
-    if strength == "منخفض":
-        return "🟢"
-    return "⚡"
-
-def build_message(
-    title: str,
-    body: str,
-    source: str,
-    when_dt: datetime,
-    strength: str,
-    sentiment: str,
-    currency: Optional[str] = None,
-    country: Optional[str] = None,
-    is_star: bool = False,
-) -> str:
-    # Clean inputs
-    title = normalize_spaces(strip_links(title))
-    body = normalize_spaces(strip_links(body))
-    source = normalize_spaces(strip_links(source))
-
-    # Optional flags
-    top_badge = f"{sentiment_icon(sentiment)} {sentiment}"
-    if currency:
-        top_badge += f" | {currency.strip().upper()}"
-
-    star_line = "⭐ <b>خبر مميز اليوم</b>\n\n" if is_star else ""
-
-    msg = (
-        f"{star_line}"
-        f"<b>{top_badge}</b>\n\n"
-        f"🔔 <b>صدر الآن!!</b>\n\n"
-        f"📌 <b>{title}</b>\n\n"
-    )
-
-    if body:
-        msg += f"📝 <b>التفاصيل:</b>\n{body}\n\n"
-
-    if country or currency:
-        msg += "━━━━━━━━━━━━━━\n"
-        if country:
-            msg += f"📍 <b>الدولة:</b> {country}\n"
-        if currency:
-            msg += f"💱 <b>العملة:</b> {currency.strip().upper()}\n"
-        msg += "\n"
-
-    msg += (
-        "━━━━━━━━━━━━━━\n"
-        f"{strength_icon(strength)} <b>قوة الخبر:</b> {strength}\n"
-        f"{market_brain_icon(sentiment)} <b>اتجاه السوق:</b> {sentiment}\n\n"
-        f"🕒 <b>{fmt_dt(when_dt)}</b>\n"
-        f"📰 <b>المصدر:</b> {source}\n"
-        f"\n— @news_forexq"
-    )
-
-    return msg
-
-# ---------------------------
-# Translation (Optional)
-# ---------------------------
+# =========================
+# OPTIONAL TRANSLATION (EN->AR)
+# =========================
 _translator = None
+
 def translate_to_ar(text: str) -> str:
+    # Only if enabled
     global _translator
     if not TRANSLATE_EN:
         return text
@@ -215,12 +134,78 @@ def translate_to_ar(text: str) -> str:
             _translator = GoogleTranslator(source="auto", target="ar")
         return _translator.translate(text)
     except Exception:
-        # If translation fails, return original
         return text
 
-# ---------------------------
-# State (dedupe + alerts)
-# ---------------------------
+
+# =========================
+# CLASSIFY: strength + sentiment
+# =========================
+HIGH_KW = [
+    # Central banks & rates
+    "rate decision", "interest rate", "fomc", "fed", "powell", "ecb", "boe", "boj",
+    "قرار الفائدة", "سعر الفائدة", "الفيدرالي", "باول", "المركزي الأوروبي", "بنك إنجلترا", "بنك اليابان",
+    # Major data
+    "cpi", "inflation", "nfp", "jobs report", "unemployment", "gdp", "pmi",
+    "التضخم", "مؤشر أسعار المستهلك", "الوظائف", "البطالة", "الناتج المحلي", "مديري المشتريات",
+    # Risk / shocks
+    "breaking", "urgent", "intervention", "sanction", "war",
+    "عاجل", "تحذير", "تدخل", "عقوبات", "حرب",
+]
+
+MED_KW = [
+    "retail sales", "ppi", "consumer confidence", "housing", "minutes", "speech",
+    "مبيعات التجزئة", "أسعار المنتجين", "ثقة المستهلك", "الإسكان", "محضر", "خطاب", "تصريحات",
+    "gold", "xau", "oil", "brent", "wti",
+    "الذهب", "النفط",
+    "usd", "eur", "gbp", "jpy", "chf", "cad", "aud", "nzd",
+    "الدولار", "اليورو", "الإسترليني", "الين",
+]
+
+POS_KW = ["يرتفع", "ارتفاع", "يصعد", "صعود", "مكاسب", "إيجابي", "قوي", "يتحسن", "قفز", "زيادة",
+          "rise", "up", "gains", "bullish", "beats", "strong"]
+NEG_KW = ["ينخفض", "انخفاض", "يهبط", "هبوط", "خسائر", "سلبي", "ضعيف", "يتراجع", "هبوط حاد", "تراجع",
+          "fall", "down", "losses", "bearish", "misses", "weak"]
+
+
+def classify_strength(text: str) -> str:
+    t = (text or "").lower()
+    if any(k in t for k in HIGH_KW):
+        return "HIGH"
+    if any(k in t for k in MED_KW):
+        return "MED"
+    return "LOW"
+
+
+def classify_sentiment(text: str) -> str:
+    t = (text or "").lower()
+    p = sum(1 for k in POS_KW if k in t)
+    n = sum(1 for k in NEG_KW if k in t)
+    if p > n and p > 0:
+        return "إيجابي"
+    if n > p and n > 0:
+        return "سلبي"
+    return "محايد"
+
+
+def strength_label(strength: str) -> str:
+    if strength == "HIGH":
+        return "عالي جداً 🔥"
+    if strength == "MED":
+        return "متوسط ⚡"
+    return "منخفض ✨"
+
+
+def sentiment_badge(sentiment: str) -> str:
+    if sentiment == "إيجابي":
+        return "🟢 <b>إيجابي</b>"
+    if sentiment == "سلبي":
+        return "🔴 <b>سلبي</b>"
+    return "⚪️ <b>محايد</b>"
+
+
+# =========================
+# STATE (dedupe)
+# =========================
 def load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_FILE):
         return {"sent": {}, "alerts": {}}
@@ -230,6 +215,7 @@ def load_state() -> Dict[str, Any]:
     except Exception:
         return {"sent": {}, "alerts": {}}
 
+
 def save_state(state: Dict[str, Any]) -> None:
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -237,136 +223,18 @@ def save_state(state: Dict[str, Any]) -> None:
     except Exception as e:
         logger.warning("Failed saving state: %s", e)
 
-def mark_sent(state: Dict[str, Any], item_id: str) -> None:
-    state.setdefault("sent", {})[item_id] = int(time.time())
 
 def is_sent(state: Dict[str, Any], item_id: str) -> bool:
     return item_id in state.get("sent", {})
 
-def set_alert_sent(state: Dict[str, Any], alert_id: str) -> None:
-    state.setdefault("alerts", {})[alert_id] = int(time.time())
 
-def is_alert_sent(state: Dict[str, Any], alert_id: str) -> bool:
-    return alert_id in state.get("alerts", {})
+def mark_sent(state: Dict[str, Any], item_id: str) -> None:
+    state.setdefault("sent", {})[item_id] = int(time.time())
 
-# ---------------------------
-# Sending Queue (Flood Control Safe)
-# ---------------------------
-class Sender:
-    def __init__(self, bot: Bot, channel_id: str, delay: float = 3.5):
-        self.bot = bot
-        self.channel_id = channel_id
-        self.delay = delay
-        self.queue: asyncio.Queue[Tuple[str, Optional[int]]] = asyncio.Queue()
-        self.worker_task: Optional[asyncio.Task] = None
 
-    async def start(self):
-        if self.worker_task is None:
-            self.worker_task = asyncio.create_task(self._worker())
-
-    async def send(self, text: str, reply_to_message_id: Optional[int] = None):
-        await self.queue.put((text, reply_to_message_id))
-
-    async def _worker(self):
-        while True:
-            text, reply_to = await self.queue.get()
-            try:
-                await self._send_with_retry(text, reply_to)
-            finally:
-                await asyncio.sleep(self.delay)
-                self.queue.task_done()
-
-    async def _send_with_retry(self, text: str, reply_to: Optional[int]):
-        # Basic retry logic for Telegram
-        for _ in range(6):
-            try:
-                await self.bot.send_message(
-                    chat_id=self.channel_id,
-                    text=text,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,  # remove previews
-                    reply_to_message_id=reply_to,
-                )
-                return
-            except RetryAfter as e:
-                wait = int(getattr(e, "retry_after", 5)) + 1
-                logger.warning("RetryAfter: waiting %s seconds", wait)
-                await asyncio.sleep(wait)
-            except (TimedOut, NetworkError):
-                logger.warning("Network/Timeout, retrying...")
-                await asyncio.sleep(3)
-            except Exception as e:
-                logger.error("Send failed: %s", e)
-                await asyncio.sleep(2)
-
-# ---------------------------
-# RSS Fetching
-# ---------------------------
-def extract_entry_text(entry: Dict[str, Any]) -> Tuple[str, str]:
-    title = entry.get("title", "") or ""
-    summary = entry.get("summary", "") or entry.get("description", "") or ""
-    # feedparser summaries may include HTML tags; we keep it simple (strip links)
-    summary = re.sub(r"<[^>]+>", " ", summary)
-    summary = normalize_spaces(summary)
-    return title, summary
-
-def parse_entry_time(entry: Dict[str, Any]) -> datetime:
-    # Prefer published, then updated, else now
-    for key in ("published", "updated", "created"):
-        if entry.get(key):
-            try:
-                dt = dtparser.parse(entry[key])
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt.astimezone(timezone(timedelta(hours=3)))
-            except Exception:
-                pass
-    return now_kuwait()
-
-async def fetch_rss_items() -> List[Dict[str, Any]]:
-    items: List[Dict[str, Any]] = []
-    for url in RSS_FEEDS:
-        try:
-            feed = feedparser.parse(url)
-            for e in feed.entries[:30]:
-                title, summary = extract_entry_text(e)
-                pub_dt = parse_entry_time(e)
-                source = guess_source(e, url)
-
-                # Optional Arabic-only filter
-                txt_all = f"{title} {summary}"
-                if ARABIC_ONLY and not has_arabic(txt_all):
-                    # Try translate if enabled, otherwise skip
-                    if TRANSLATE_EN:
-                        title_ar = translate_to_ar(title)
-                        summary_ar = translate_to_ar(summary)
-                        if not has_arabic(title_ar + " " + summary_ar):
-                            continue
-                        title, summary = title_ar, summary_ar
-                    else:
-                        continue
-
-                item_id = short_hash(source, title, str(pub_dt))
-                items.append({
-                    "id": item_id,
-                    "title": title,
-                    "summary": summary,
-                    "source": source,
-                    "published": pub_dt,
-                })
-        except Exception as ex:
-            logger.warning("RSS fetch failed for %s: %s", url, ex)
-    # Newest first
-    items.sort(key=lambda x: x["published"], reverse=True)
-    return items
-
-# ---------------------------
-# Events (High Impact Alerts) via events.json
-# ---------------------------
-# events.json example:
-# [
-#   {"id":"usd_nfp", "title":"NFP - التغير في الوظائف غير الزراعية", "currency":"USD", "country":"الولايات المتحدة", "datetime":"2025-12-26 16:30", "impact":"high", "source":"Economic Calendar"}
-# ]
+# =========================
+# EVENTS ALERTS (optional)
+# =========================
 def load_events() -> List[Dict[str, Any]]:
     if not os.path.exists(EVENTS_FILE):
         return []
@@ -377,53 +245,201 @@ def load_events() -> List[Dict[str, Any]]:
         for ev in raw:
             dt = dtparser.parse(ev["datetime"])
             if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone(timedelta(hours=3)))
+                dt = dt.replace(tzinfo=KUWAIT_TZ)
             out.append({
                 "id": ev.get("id") or short_hash(ev.get("title", ""), ev.get("datetime", "")),
-                "title": ev.get("title", ""),
-                "currency": ev.get("currency"),
-                "country": ev.get("country"),
-                "dt": dt,
+                "title": clean(ev.get("title", "")),
+                "currency": clean(ev.get("currency", "")).upper(),
+                "country": clean(ev.get("country", "")),
+                "dt": dt.astimezone(KUWAIT_TZ),
                 "impact": (ev.get("impact") or "").lower(),
-                "source": ev.get("source") or "Economic Calendar",
+                "source": clean(ev.get("source") or "Economic Calendar"),
             })
         return out
     except Exception as e:
         logger.warning("Failed reading events.json: %s", e)
         return []
 
-def is_high_impact(ev: Dict[str, Any]) -> bool:
+
+def is_high_impact_event(ev: Dict[str, Any]) -> bool:
     return ev.get("impact") in ("high", "strong", "عالي")
 
-def build_alert_message(ev: Dict[str, Any], minutes_before: int) -> str:
-    title = normalize_spaces(strip_links(ev.get("title", "")))
-    currency = (ev.get("currency") or "").strip().upper()
-    source = normalize_spaces(strip_links(ev.get("source", "Economic Calendar")))
 
-    if minutes_before == 30:
-        header = "⚠️ <b>تنبيه خبر قوي بعد 30 دقيقة</b>"
-    else:
-        header = "🔥 <b>خبر قوي بعد 5 دقائق!</b>"
+def set_alert_sent(state: Dict[str, Any], alert_id: str) -> None:
+    state.setdefault("alerts", {})[alert_id] = int(time.time())
 
+
+def is_alert_sent(state: Dict[str, Any], alert_id: str) -> bool:
+    return alert_id in state.get("alerts", {})
+
+
+def build_event_alert(ev: Dict[str, Any], minutes_before: int) -> str:
+    header = "⚠️ <b>تنبيه خبر قوي بعد 30 دقيقة</b>" if minutes_before == 30 else "🔥 <b>خبر قوي بعد 5 دقائق!</b>"
     msg = (
         f"{header}\n\n"
-        f"📌 <b>{title}</b>\n"
+        f"📌 <b>{ev['title']}</b>\n"
+        f"💱 <b>العملة:</b> {ev['currency']}\n"
+        f"🕒 <b>وقت الخبر:</b> {fmt_dt(ev['dt'])}\n"
+        f"📰 <b>المصدر:</b> {ev['source']}\n\n"
+        f"— @news_forexq"
     )
-    if currency:
-        msg += f"💱 <b>العملة:</b> {currency}\n"
-    msg += f"📰 <b>المصدر:</b> {source}\n\n"
-    fdt = fmt_dt(ev["dt"].astimezone(timezone(timedelta(hours=3))))
-    msg += f"🕒 <b>وقت الخبر:</b> {fdt}\n\n— @news_forexq"
     return msg
 
-# ---------------------------
-# Main loop
-# ---------------------------
-async def run_bot(app: Application):
+
+# =========================
+# TELEGRAM SENDER (Flood-safe queue)
+# =========================
+class Sender:
+    def __init__(self, bot: Bot, channel_id: str, delay: float):
+        self.bot = bot
+        self.channel_id = channel_id
+        self.delay = delay
+        self.q: asyncio.Queue[str] = asyncio.Queue()
+        self.task: Optional[asyncio.Task] = None
+
+    async def start(self):
+        if self.task is None:
+            self.task = asyncio.create_task(self.worker())
+
+    async def enqueue(self, text: str):
+        await self.q.put(text)
+
+    async def worker(self):
+        while True:
+            text = await self.q.get()
+            try:
+                await self.send_with_retry(text)
+            finally:
+                await asyncio.sleep(self.delay)
+                self.q.task_done()
+
+    async def send_with_retry(self, text: str):
+        for _ in range(8):
+            try:
+                await self.bot.send_message(
+                    chat_id=self.channel_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                return
+            except RetryAfter as e:
+                wait = int(getattr(e, "retry_after", 5)) + 1
+                logger.warning("Flood control: wait %ss", wait)
+                await asyncio.sleep(wait)
+            except (TimedOut, NetworkError):
+                await asyncio.sleep(3)
+            except Exception as ex:
+                logger.error("Send failed: %s", ex)
+                await asyncio.sleep(2)
+
+
+# =========================
+# MESSAGE TEMPLATE (احترافي مرتب)
+# =========================
+def build_news_message(title: str, summary: str, src: str, strength: str, sentiment: str, when_dt: datetime) -> str:
+    title = clean(title)
+    summary = clean(summary)
+
+    # summary مختصر ونظيف
+    if summary:
+        if summary.startswith(title):
+            summary = summary[len(title):].strip()
+        if len(summary) > 520:
+            summary = summary[:520].rstrip() + "..."
+
+    badge = sentiment_badge(sentiment)
+    power = strength_label(strength)
+
+    star = "⭐ <b>خبر مميز اليوم</b>\n\n" if strength == "HIGH" else ""
+
+    msg = (
+        f"{star}"
+        f"{badge}\n\n"
+        f"🔔🌐 <b>صدر الآن</b> ‼️\n\n"
+        f"📌 <b>{title}</b>\n\n"
+    )
+
+    if summary:
+        msg += f"📝 <b>ملخص الخبر:</b>\n{summary}\n\n"
+
+    msg += (
+        "━━━━━━━━━━━━━━\n"
+        f"⚡ <b>قوة الخبر:</b> {power}\n"
+        f"🧠 <b>اتجاه السوق:</b> {sentiment}\n\n"
+        f"🕒 <b>{fmt_dt(when_dt)}</b>\n"
+        f"📰 <b>المصدر:</b> {src}\n\n"
+        f"— @news_forexq"
+    )
+
+    # ضمان نهائي: ما فيه روابط
+    return strip_links(msg)
+
+
+# =========================
+# RSS FETCH
+# =========================
+async def fetch_items() -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for url in RSS_FEEDS:
+        try:
+            d = feedparser.parse(url)
+            for e in getattr(d, "entries", [])[:40]:
+                title = clean(getattr(e, "title", "") or "")
+                summary = clean(getattr(e, "summary", "") or getattr(e, "description", "") or "")
+                pub_dt = parse_entry_time(e)
+                src = source_name(e, url)
+
+                if not title:
+                    continue
+
+                # عربي فقط + خيار ترجمة
+                all_text = f"{title} {summary}"
+                if ARABIC_ONLY and not has_arabic(all_text):
+                    if TRANSLATE_EN:
+                        title = translate_to_ar(title)
+                        summary = translate_to_ar(summary)
+                        if ARABIC_ONLY and not has_arabic(f"{title} {summary}"):
+                            continue
+                    else:
+                        continue
+
+                strength = classify_strength(all_text)
+                sentiment = classify_sentiment(all_text)
+
+                # ✅ المطلوب: أخبار اقتصادية عامة (HIGH + MED) فقط
+                if strength not in ("HIGH", "MED"):
+                    continue
+
+                item_id = short_hash(src, title, str(pub_dt))
+                items.append({
+                    "id": item_id,
+                    "title": title,
+                    "summary": summary,
+                    "src": src,
+                    "published": pub_dt,
+                    "strength": strength,
+                    "sentiment": sentiment,
+                })
+
+        except Exception as ex:
+            logger.warning("RSS fetch failed for %s: %s", url, ex)
+
+    # newest first
+    items.sort(key=lambda x: x["published"], reverse=True)
+    return items
+
+
+# =========================
+# MAIN LOOP
+# =========================
+async def run():
     if not BOT_TOKEN or not CHANNEL_ID:
         raise RuntimeError("Missing BOT_TOKEN or CHANNEL_ID in environment variables.")
+    if not RSS_FEEDS:
+        raise RuntimeError("Missing RSS_FEEDS env var (comma-separated).")
 
-    bot = app.bot
+    bot = Bot(token=BOT_TOKEN)
     sender = Sender(bot, CHANNEL_ID, delay=SEND_DELAY_SECONDS)
     await sender.start()
 
@@ -432,80 +448,62 @@ async def run_bot(app: Application):
 
     while True:
         try:
-            # 1) Send scheduled alerts for high impact events
+            # 1) Calendar alerts (optional) — if you keep events.json
             events = load_events()
-            now_dt = now_kuwait()
+            now_dt = now_kw()
 
             for ev in events:
-                if not is_high_impact(ev):
+                if not is_high_impact_event(ev):
                     continue
 
-                # Alert 30 minutes
-                t30 = ev["dt"] - timedelta(minutes=30)
-                alert30_id = f"{ev['id']}_a30"
-                if t30 <= now_dt <= t30 + timedelta(minutes=1) and not is_alert_sent(state, alert30_id):
-                    await sender.send(build_alert_message(ev, 30))
-                    set_alert_sent(state, alert30_id)
-                    save_state(state)
+                alert30 = f"{ev['id']}_30"
+                alert5 = f"{ev['id']}_5"
 
-                # Alert 5 minutes
-                t5 = ev["dt"] - timedelta(minutes=5)
-                alert5_id = f"{ev['id']}_a05"
-                if t5 <= now_dt <= t5 + timedelta(minutes=1) and not is_alert_sent(state, alert5_id):
-                    await sender.send(build_alert_message(ev, 5))
-                    set_alert_sent(state, alert5_id)
-                    save_state(state)
+                if (ev["dt"] - timedelta(minutes=30)) <= now_dt < ev["dt"] and not is_alert_sent(state, alert30):
+                    # window 1 minute
+                    if now_dt <= (ev["dt"] - timedelta(minutes=29, seconds=0)):
+                        await sender.enqueue(build_event_alert(ev, 30))
+                        set_alert_sent(state, alert30)
+                        save_state(state)
 
-            # 2) Fetch RSS news & post
-            items = await fetch_rss_items()
+                if (ev["dt"] - timedelta(minutes=5)) <= now_dt < ev["dt"] and not is_alert_sent(state, alert5):
+                    if now_dt <= (ev["dt"] - timedelta(minutes=4, seconds=0)):
+                        await sender.enqueue(build_event_alert(ev, 5))
+                        set_alert_sent(state, alert5)
+                        save_state(state)
 
-            # Post only a few newest each cycle to avoid flooding
-            for it in items[:5]:
+            # 2) Economic news RSS (HIGH + MED)
+            items = await fetch_items()
+
+            # prevent flooding: post up to 6 per cycle
+            posted = 0
+            for it in items:
+                if posted >= 6:
+                    break
                 if is_sent(state, it["id"]):
                     continue
 
-                title = it["title"]
-                summary = it["summary"]
-                source = it["source"]
-                pub_dt = it["published"]
-
-                # Remove any duplicated title from summary (some feeds repeat it)
-                if summary and normalize_spaces(summary).startswith(normalize_spaces(title)):
-                    summary = normalize_spaces(summary[len(title):])
-
-                # Strength & sentiment
-                strength = detect_strength(title + " " + summary)
-                sentiment = detect_sentiment(title + " " + summary)
-
-                # ⭐ Star for strong news
-                is_star = (strength == "عالي")
-
-                # If you want to detect currency/country from text, tell me، حالياً اختياري
-                msg = build_message(
-                    title=title,
-                    body=summary,
-                    source=source,
-                    when_dt=pub_dt,
-                    strength=strength,
-                    sentiment=sentiment,
-                    currency=None,
-                    country=None,
-                    is_star=is_star,
+                msg = build_news_message(
+                    title=it["title"],
+                    summary=it["summary"],
+                    src=it["src"],
+                    strength=it["strength"],
+                    sentiment=it["sentiment"],
+                    when_dt=it["published"],
                 )
 
-                await sender.send(msg)
+                await sender.enqueue(msg)
+
                 mark_sent(state, it["id"])
                 save_state(state)
+                posted += 1
 
             await asyncio.sleep(POLL_SECONDS)
 
-        except Exception as e:
-            logger.exception("Loop error: %s", e)
+        except Exception as ex:
+            logger.exception("Loop error: %s", ex)
             await asyncio.sleep(5)
 
-async def main():
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-    await run_bot(application)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run())
