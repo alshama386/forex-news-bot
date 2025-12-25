@@ -1,14 +1,12 @@
 import os
-import re
 import time
-import asyncio
+import re
 import sqlite3
 import hashlib
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 import feedparser
-from telegram import Bot
-from telegram.constants import ParseMode
+import requests
 
 # =========================
 # CONFIG
@@ -17,82 +15,71 @@ TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise Exception("BOT_TOKEN missing in environment variables (BOT_TOKEN)")
 
+# قناة تيليجرام (يوزرنيم القناة بدون @ أو مع @ الاثنين يمشون)
 CHANNEL = "@news_forexq"
 SIGNATURE = "\n\n— @news_forexq"
 
-# ✅ عربي فقط (شيلنا Investing لأنه يطلع إنجليزي)
-NEWS_FEEDS = [
-    "https://ar.fxstreet.com/rss/news",
-    "https://www.arabictrader.com/rss/news",
-    "https://arab.dailyforex.com/rss/arab/forexnews.xml",
+# مصادر عربية (RSS)
+FEEDS = [
+    "https://ar.fxstreet.com/rss/news",                  # FXStreet Arabic
+    "https://www.arabictrader.com/rss/news",             # ArabicTrader
+    "https://arab.dailyforex.com/rss/arab/forexnews.xml" # DailyForex Arabic
 ]
 
-# ✅ تقويم اقتصادي (للتنبيهات قبل الأخبار الكبيرة)
-# ملاحظة: هذا مصدر تقويم اقتصادي (قد يتغير رابطهم مستقبلاً)
-CALENDAR_FEEDS = [
-    "https://www.myfxbook.com/rss/forex-economic-calendar-events",
-]
-
-POLL_NEWS_SECONDS = 30
-POLL_CALENDAR_SECONDS = 30
-
+POLL_SECONDS = 25
 MAX_PER_FEED = 25
-SUMMARY_MAX_CHARS = 320
+SUMMARY_MAX_CHARS = 360
 
-ALERTS_MINUTES = [30, 5]  # تنبيه قبل 30 دقيقة وقبل 5 دقائق
-
-# كلمات “أحداث كبيرة” للتنبيه
-MAJOR_EVENT_KEYWORDS = [
-    "fomc", "fed", "powell", "interest rate", "rate decision",
-    "cpi", "inflation", "ppi",
-    "nfp", "nonfarm", "jobs", "unemployment",
-    "gdp", "retail sales",
-    "boe", "ecb", "boj",
+# كلمات "عاجل/ذهبي" (عربي + إنجليزي لو طلع ضمن النص)
+URGENT_KEYWORDS = [
+    "عاجل", "خبر عاجل", "تنبيه", "تحذير",
+    "الفيدرالي", "باول", "فايدة", "قرار الفائدة",
+    "التضخم", "cpi", "nfp", "الوظائف",
+    "ذهب", "xau", "الدولار", "usd",
+    "eurusd", "gbpusd", "usdjpy",
+    "برنت", "wti", "نفط", "oil",
+    "تدخل", "intervention"
 ]
+
+# تصنيف "قوة الخبر" (تقريبي حسب كلمات)
+IMPACT_HIGH = ["قرار", "الفائدة", "الفيدرالي", "باول", "cpi", "nfp", "تضخم", "jobs", "تدخل", "intervention"]
+IMPACT_MED  = ["توقعات", "بيانات", "مؤشر", "تصريحات", "محضر", "gdp", "pmi", "مبيعات", "بطالة"]
+IMPACT_LOW  = ["تحليل", "نظرة", "ملخص", "تعليق", "افتتاح", "إغلاق", "استقرار"]
+
+# تصنيف "اتجاه السوق" (تقريبي)
+POS_WORDS = ["ارتفاع", "صعود", "مكاسب", "إيجابي", "يتحسن", "قوي", "انتعاش", "يرتفع", "يزيد"]
+NEG_WORDS = ["هبوط", "انخفاض", "خسائر", "سلبي", "يتراجع", "ضعيف", "تراجع", "ينخفض", "يهبط"]
 
 # =========================
-# DB (SQLite) - Dedup & Alerts
+# DATABASE (dedup)
 # =========================
 DB_FILE = "posted.db"
 
-def db_conn():
-    return sqlite3.connect(DB_FILE)
-
 def init_db() -> None:
-    conn = db_conn()
+    conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-
     cur.execute("""
         CREATE TABLE IF NOT EXISTS posted (
             id TEXT PRIMARY KEY,
             created_at TEXT
         )
     """)
-
-    # alerts table to prevent sending same alert repeatedly
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS alerts (
-            id TEXT PRIMARY KEY,
-            created_at TEXT
-        )
-    """)
-
     conn.commit()
     conn.close()
 
-def seen(table: str, item_id: str) -> bool:
-    conn = db_conn()
+def already_posted(item_id: str) -> bool:
+    conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute(f"SELECT 1 FROM {table} WHERE id=?", (item_id,))
+    cur.execute("SELECT 1 FROM posted WHERE id=?", (item_id,))
     row = cur.fetchone()
     conn.close()
     return row is not None
 
-def mark_seen(table: str, item_id: str) -> None:
-    conn = db_conn()
+def mark_posted(item_id: str) -> None:
+    conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute(
-        f"INSERT OR IGNORE INTO {table} (id, created_at) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO posted (id, created_at) VALUES (?, ?)",
         (item_id, datetime.now(timezone.utc).isoformat())
     )
     conn.commit()
@@ -101,15 +88,24 @@ def mark_seen(table: str, item_id: str) -> None:
 # =========================
 # HELPERS
 # =========================
+URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
+
 def clean(text: str) -> str:
     if not text:
         return ""
-    # remove html tags loosely
-    text = re.sub(r"<[^>]+>", " ", text)
     return " ".join(text.replace("\n", " ").split()).strip()
 
-def make_hash_id(*parts: str) -> str:
-    raw = "||".join(clean(p) for p in parts).encode("utf-8")
+def remove_urls(text: str) -> str:
+    """يشيل أي رابط من النص نهائياً."""
+    if not text:
+        return ""
+    text = URL_RE.sub("", text)  # remove urls
+    # remove any leftover lines containing 'http'
+    lines = [ln for ln in text.splitlines() if "http" not in ln.lower()]
+    return " ".join(" ".join(lines).split()).strip()
+
+def make_hash_id(title: str, published: str, src: str) -> str:
+    raw = (clean(title) + "||" + clean(published) + "||" + clean(src)).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
 def source_label(feed_url: str) -> str:
@@ -120,216 +116,170 @@ def source_label(feed_url: str) -> str:
         return "المتداول العربي"
     if "dailyforex" in u:
         return "DailyForex"
-    if "myfxbook" in u:
-        return "Myfxbook Calendar"
     return "المصدر"
 
-def is_mostly_arabic(text: str) -> bool:
-    # if Arabic letters ratio is low -> treat as non-arabic
-    if not text:
-        return False
-    arabic = sum(1 for ch in text if "\u0600" <= ch <= "\u06FF")
-    latin = sum(1 for ch in text if ("A" <= ch <= "Z") or ("a" <= ch <= "z"))
-    # allow some latin (pairs like USD/JPY) لكن إذا طغى الإنجليزي نرفضه
-    return arabic >= 10 and latin < arabic
+def is_urgent(title: str, summary: str) -> bool:
+    combined = (title + " " + summary).lower()
+    return any(k.lower() in combined for k in URGENT_KEYWORDS)
 
-def infer_market_mood(text: str) -> str:
-    t = text.lower()
-    pos = ["يرتفع", "يصعد", "مكاسب", "يدعم", "قوي", "تعافى", "تحسن", "gains", "rises", "strong"]
-    neg = ["ينخفض", "يهبط", "خسائر", "ضعيف", "ضغط", "يتراجع", "هبوط", "falls", "drops", "weak"]
-    if any(w in t for w in pos):
+def impact_level(title: str, summary: str) -> str:
+    t = (title + " " + summary).lower()
+    if any(k.lower() in t for k in IMPACT_HIGH):
+        return "عالي جداً"
+    if any(k.lower() in t for k in IMPACT_MED):
+        return "متوسط"
+    if any(k.lower() in t for k in IMPACT_LOW):
+        return "منخفض"
+    return "متوسط"
+
+def market_sentiment(title: str, summary: str) -> str:
+    t = (title + " " + summary).lower()
+    pos = sum(1 for w in POS_WORDS if w in t)
+    neg = sum(1 for w in NEG_WORDS if w in t)
+    if pos > neg and pos >= 1:
         return "إيجابي"
-    if any(w in t for w in neg):
+    if neg > pos and neg >= 1:
         return "سلبي"
     return "محايد"
 
-def infer_strength(text: str) -> str:
-    t = text.lower()
-    if any(k in t for k in ["عاجل", "breaking", "urgent", "flash"]):
-        return "عالي جداً"
-    if any(k in t for k in MAJOR_EVENT_KEYWORDS):
-        return "عالي"
-    if any(k in t for k in ["تحذير", "تنبيه", "مفاجأة"]):
-        return "متوسط"
-    return "متوسط"
+def affected_assets(title: str, summary: str) -> str:
+    t = (title + " " + summary).lower()
+    assets = []
+    # عملات/أزواج شائعة
+    for key, name in [
+        ("eurusd", "EUR/USD"),
+        ("gbpusd", "GBP/USD"),
+        ("usdjpy", "USD/JPY"),
+        ("usdchf", "USD/CHF"),
+        ("audusd", "AUD/USD"),
+        ("usdcad", "USD/CAD"),
+        ("nzdusd", "NZD/USD"),
+        ("xau", "الذهب"),
+        ("gold", "الذهب"),
+        ("oil", "النفط"),
+        ("brent", "النفط (برنت)"),
+        ("wti", "النفط (WTI)"),
+        ("usd", "الدولار"),
+        ("eur", "اليورو"),
+        ("gbp", "الإسترليني"),
+        ("jpy", "الين"),
+        ("chf", "الفرنك"),
+        ("aud", "الأسترالي"),
+        ("cad", "الكندي"),
+        ("nzd", "النيوزيلندي"),
+    ]:
+        if key in t and name not in assets:
+            assets.append(name)
 
-def golden_warning_tag(text: str) -> str:
-    # "تحذير ذهبي" إذا الخبر يحمل كلمات خطورة
-    t = text.lower()
-    danger = ["تحذير", "مخاطر", "تدخل", "تقلبات", "هبوط حاد", "انهيار", "crash", "intervention", "risk"]
-    return "🟡 تحذير ذهبي" if any(w in t for w in danger) else ""
+    if not assets:
+        return "—"
+    # لا نطوّل
+    return "، ".join(assets[:4]) + ("…" if len(assets) > 4 else "")
 
 def short_summary(summary: str) -> str:
     s = clean(summary)
+    s = remove_urls(s)  # ✅ أهم سطر: شيل الروابط من الوصف نفسه
     if not s:
         return ""
     return s[:SUMMARY_MAX_CHARS] + ("..." if len(s) > SUMMARY_MAX_CHARS else "")
 
-def build_news_message(title: str, summary: str, src: str) -> str:
-    title = clean(title)
+def tg_send_message(html_text: str) -> None:
+    """إرسال رسالة تيليجرام (HTML) بدون روابط ومع إيقاف المعاينة."""
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHANNEL,
+        "text": html_text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    r = requests.post(url, data=payload, timeout=20)
+    if r.status_code != 200:
+        raise Exception(f"Telegram API error: {r.status_code} {r.text}")
+
+def build_news_message(title: str, summary: str, src: str, published: str) -> str:
+    title = remove_urls(clean(title))  # ✅ حتى لو عنوانه فيه رابط
     summary = short_summary(summary)
 
-    mood = infer_market_mood(title + " " + summary)
-    strength = infer_strength(title + " " + summary)
-    gold = golden_warning_tag(title + " " + summary)
+    imp = impact_level(title, summary)
+    mood = market_sentiment(title, summary)
+    assets = affected_assets(title, summary)
 
-    msg = f"📰 <b>{title}</b>\n"
+    # شارة "تنبيه ذهبي" إذا عاجل
+    urgent = is_urgent(title, summary)
+    header = "🟨 <b>تحذير ذهبي</b>\n" if urgent else "📰 "
+
+    msg = f"{header}<b>{title}</b>\n\n"
     if summary:
-        msg += f"\n{summary}\n"
+        msg += f"{summary}\n\n"
 
-    if gold:
-        msg += f"\n{gold}\n"
-
-    msg += f"\n⚡ <b>قوة الخبر:</b> {strength}"
-    msg += f"\n🧠 <b>اتجاه السوق:</b> {mood}"
-    msg += f"\n🔗 <b>المصدر:</b> {src}"
-
+    msg += "ــــــــــــــــــــــــــــــ\n"
+    msg += f"📊 <b>قوة الخبر:</b> {imp}\n"
+    msg += f"🧠 <b>اتجاه السوق:</b> {mood}\n"
+    msg += f"📌 <b>الأموال المتأثرة:</b> {assets}\n"
+    msg += f"🕒 <b>الوقت:</b> {published}\n"
+    msg += f"🔗 <b>المصدر:</b> {src}\n"
+    msg += "ــــــــــــــــــــــــــــــ"
     msg += SIGNATURE
+
+    # ✅ ضمان نهائي: لا روابط أبداً
+    msg = remove_urls(msg)
     return msg
 
-def is_major_event(text: str) -> bool:
-    t = text.lower()
-    return any(k in t for k in MAJOR_EVENT_KEYWORDS)
-
-def parse_entry_datetime(entry) -> datetime | None:
-    """
-    Try to get an event/news time:
-    - published_parsed if present (RSS)
-    - otherwise try to parse date from summary/title
-    """
-    if getattr(entry, "published_parsed", None):
-        dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-        return dt
-
-    blob = clean(entry.get("summary") or entry.get("description") or "") + " " + clean(entry.get("title") or "")
-    # Try common formats: YYYY-MM-DD HH:MM
-    m = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})", blob)
-    if m:
+def format_published(entry) -> str:
+    # نحاول نطلع وقت جميل، وإذا ما توفر نستخدم UTC الحالي
+    dt = None
+    if hasattr(entry, "published_parsed") and entry.published_parsed:
         try:
-            return datetime.fromisoformat(f"{m.group(1)} {m.group(2)}").replace(tzinfo=timezone.utc)
-        except:
-            return None
-    return None
+            dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+        except Exception:
+            dt = None
 
-def format_dt_kuwait(dt_utc: datetime) -> str:
-    # Kuwait = UTC+3
-    kuwait_tz = timezone(timedelta(hours=3))
-    return dt_utc.astimezone(kuwait_tz).strftime("%Y-%m-%d %H:%M")
+    if not dt:
+        dt = datetime.now(timezone.utc)
 
-def build_alert_message(event_title: str, minutes: int, src: str, when_utc: datetime) -> str:
-    title = clean(event_title)
-    tag = "🚨" if minutes <= 5 else "⏰"
-    return (
-        f"{tag} <b>تنبيه مهم</b>\n"
-        f"\n<b>بعد {minutes} دقيقة:</b> {title}\n"
-        f"\n🕒 <b>وقت الحدث (الكويت):</b> {format_dt_kuwait(when_utc)}"
-        f"\n🔗 <b>المصدر:</b> {src}"
-        f"{SIGNATURE}"
-    )
+    # صيغة واضحة
+    return dt.strftime("%Y-%m-%d %H:%M UTC")
 
 # =========================
-# ASYNC WORKERS
+# MAIN LOOP
 # =========================
-async def send_html(bot: Bot, text: str) -> None:
-    await bot.send_message(
-        chat_id=CHANNEL,
-        text=text,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True  # ✅ بدون روابط/بدون معاينة
-    )
-
-async def news_worker(bot: Bot) -> None:
-    while True:
-        try:
-            for url in NEWS_FEEDS:
-                feed = feedparser.parse(url)
-                src = source_label(url)
-
-                for entry in feed.entries[:MAX_PER_FEED]:
-                    title = clean(entry.get("title") or "")
-                    summary = clean(entry.get("summary") or entry.get("description") or "")
-
-                    if not title:
-                        continue
-
-                    # ✅ فلترة: أبي عربي فقط
-                    if not is_mostly_arabic(title + " " + summary):
-                        continue
-
-                    item_id = entry.get("id") or make_hash_id("news", src, title, summary)
-                    if seen("posted", item_id):
-                        continue
-
-                    msg = build_news_message(title, summary, src)
-                    await send_html(bot, msg)
-
-                    mark_seen("posted", item_id)
-                    await asyncio.sleep(1.0)
-
-            await asyncio.sleep(POLL_NEWS_SECONDS)
-
-        except Exception as ex:
-            print("NEWS Error:", ex)
-            await asyncio.sleep(10)
-
-async def calendar_worker(bot: Bot) -> None:
-    while True:
-        try:
-            now_utc = datetime.now(timezone.utc)
-
-            for url in CALENDAR_FEEDS:
-                feed = feedparser.parse(url)
-                src = source_label(url)
-
-                for entry in feed.entries[:MAX_PER_FEED]:
-                    title = clean(entry.get("title") or "")
-                    summary = clean(entry.get("summary") or entry.get("description") or "")
-
-                    if not title:
-                        continue
-
-                    event_time = parse_entry_datetime(entry)
-                    if not event_time:
-                        continue
-
-                    # نركز على الأحداث الكبيرة فقط
-                    if not is_major_event(title + " " + summary):
-                        continue
-
-                    # جهّز ID للحدث
-                    base_id = entry.get("id") or make_hash_id("cal", src, title, str(event_time))
-
-                    for minutes in ALERTS_MINUTES:
-                        alert_time = event_time - timedelta(minutes=minutes)
-
-                        # إذا وقت التنبيه صار أو قرب (± 60 ثانية)
-                        if alert_time <= now_utc <= alert_time + timedelta(seconds=60):
-                            alert_id = make_hash_id(base_id, f"alert_{minutes}")
-
-                            if seen("alerts", alert_id):
-                                continue
-
-                            msg = build_alert_message(title, minutes, src, event_time)
-                            await send_html(bot, msg)
-
-                            mark_seen("alerts", alert_id)
-                            await asyncio.sleep(0.8)
-
-            await asyncio.sleep(POLL_CALENDAR_SECONDS)
-
-        except Exception as ex:
-            print("CALENDAR Error:", ex)
-            await asyncio.sleep(10)
-
-async def main() -> None:
+def main() -> None:
     init_db()
-    bot = Bot(token=TOKEN)
-
     print("Bot Running...")
-    await asyncio.gather(
-        news_worker(bot),
-        calendar_worker(bot)
-    )
+
+    while True:
+        try:
+            for feed_url in FEEDS:
+                feed = feedparser.parse(feed_url)
+                src = source_label(feed_url)
+
+                for entry in feed.entries[:MAX_PER_FEED]:
+                    title = entry.get("title", "")
+                    link = entry.get("link", "")  # ما راح نستخدمه (طلبك إزالة الروابط)
+                    summary = entry.get("summary") or entry.get("description") or ""
+                    published = format_published(entry)
+
+                    # Dedup by id or stable hash
+                    item_id = entry.get("id") or make_hash_id(title, published, src)
+
+                    if already_posted(item_id):
+                        continue
+
+                    msg = build_news_message(title=title, summary=summary, src=src, published=published)
+
+                    # إرسال
+                    tg_send_message(msg)
+
+                    # تعليم أنه انرسل
+                    mark_posted(item_id)
+
+                    time.sleep(1.0)
+
+            time.sleep(POLL_SECONDS)
+
+        except Exception as ex:
+            print("Error:", ex)
+            time.sleep(10)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
