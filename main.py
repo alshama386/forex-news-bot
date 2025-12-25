@@ -1,509 +1,345 @@
 import os
-import re
-import json
 import time
-import asyncio
-import logging
+import sqlite3
 import hashlib
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, List, Optional, Tuple
+import asyncio
+from datetime import datetime, timezone, timedelta
+import html
 
 import feedparser
-from dateutil import parser as dtparser
+from deep_translator import GoogleTranslator
 from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TimedOut, NetworkError
 
+# =========================
+# CONFIG (Railway Env Vars)
+# =========================
+TOKEN = os.environ.get("BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Missing BOT_TOKEN in environment variables.")
+
+# تقدر تحطها @news_forexq أو ID مثل: -1003235703803
+CHANNEL_ID = os.environ.get("CHANNEL_ID") or os.environ.get("CHANNEL")
+if not CHANNEL_ID:
+    raise RuntimeError("Missing CHANNEL_ID (or CHANNEL) in environment variables.")
+
+# التوقيع
+SIGNATURE = os.environ.get("SIGNATURE", "\n\n— @news_forexq")
+
+# RSS feeds: إذا RSS_FEEDS موجودة (comma-separated) نستخدمها، غير جذي نستخدم الافتراضي
+DEFAULT_FEEDS = [
+    "https://www.investing.com/rss/news_1.rss",
+    "https://ar.fxstreet.com/rss/news",
+    "https://www.arabictrader.com/rss/news",
+    "https://arab.dailyforex.com/rss/arab/forexnews.xml",
+]
+RSS_FEEDS_ENV = (os.environ.get("RSS_FEEDS") or "").strip()
+FEEDS = [f.strip() for f in RSS_FEEDS_ENV.split(",") if f.strip()] if RSS_FEEDS_ENV else DEFAULT_FEEDS
+
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))  # خله 60 أأمن من flood
+MAX_PER_FEED = int(os.environ.get("MAX_PER_FEED", "25"))
+SUMMARY_MAX_CHARS = int(os.environ.get("SUMMARY_MAX_CHARS", "320"))
+
+DB_FILE = os.environ.get("DB_FILE", "posted.db")
+
+# توقيت الكويت UTC+3
+KUWAIT_TZ = timezone(timedelta(hours=3))
 
 # =========================
-# ENV CONFIG
+# DB (Persistent De-dup)
 # =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # e.g. "@news_forexq" or "-100..."
+def init_db() -> None:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS posted (
+            id TEXT PRIMARY KEY,
+            created_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-# RSS feeds (comma-separated)
-# Example:
-# RSS_FEEDS="https://ar.fxstreet.com/rss/news,https://www.investing.com/rss/news_1.rss,https://arab.dailyforex.com/rss/arab/forexnews.xml"
-RSS_FEEDS = [x.strip() for x in os.getenv("RSS_FEEDS", "").split(",") if x.strip()]
+def already_posted(item_id: str) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM posted WHERE id=?", (item_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
 
-ARABIC_ONLY = os.getenv("ARABIC_ONLY", "true").lower() in ("1", "true", "yes", "y")
-TRANSLATE_EN = os.getenv("TRANSLATE_EN", "false").lower() in ("1", "true", "yes", "y")
-
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
-SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "3.0"))
-
-STATE_FILE = os.getenv("STATE_FILE", "state.json")
-EVENTS_FILE = os.getenv("EVENTS_FILE", "events.json")  # optional (calendar alerts)
-
-
-# =========================
-# LOGGING
-# =========================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("forex-news-bot")
-
+def mark_posted(item_id: str) -> None:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO posted (id, created_at) VALUES (?, ?)",
+        (item_id, datetime.now(timezone.utc).isoformat())
+    )
+    conn.commit()
+    conn.close()
 
 # =========================
 # HELPERS
 # =========================
-ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
-URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
-TAG_RE = re.compile(r"<[^>]+>")
-
-KUWAIT_TZ = timezone(timedelta(hours=3))
-
-
-def now_kw() -> datetime:
-    return datetime.now(KUWAIT_TZ)
-
-
-def fmt_dt(dt: datetime) -> str:
-    return dt.astimezone(KUWAIT_TZ).strftime("%Y-%m-%d %H:%M")
-
-
-def has_arabic(text: str) -> bool:
-    return bool(ARABIC_RE.search(text or ""))
-
-
-def strip_links(text: str) -> str:
-    return URL_RE.sub("", text or "").strip()
-
-
-def strip_html(text: str) -> str:
-    return TAG_RE.sub(" ", text or "")
-
-
 def clean(text: str) -> str:
-    text = strip_html(text)
-    text = strip_links(text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    if not text:
+        return ""
+    return " ".join(str(text).replace("\n", " ").split()).strip()
 
+def make_hash_id(title: str, link: str) -> str:
+    raw = (clean(title) + "||" + clean(link)).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
-def short_hash(*parts: str) -> str:
-    h = hashlib.sha256(("|".join(parts)).encode("utf-8", errors="ignore")).hexdigest()
-    return h[:16]
-
-
-def source_name(entry: Any, feed_url: str) -> str:
-    # best-effort label without links
-    dom = feed_url.replace("https://", "").replace("http://", "").split("/")[0].lower()
-
-    if "fxstreet" in dom:
-        return "FXStreet"
-    if "investing" in dom:
+def source_label(feed_url: str) -> str:
+    u = (feed_url or "").lower()
+    if "investing" in u:
         return "Investing"
-    if "dailyforex" in dom:
-        return "DailyForex"
-    if "arabictrader" in dom:
+    if "fxstreet" in u:
+        return "FXStreet"
+    if "arabictrader" in u:
         return "ArabicTrader"
+    if "dailyforex" in u:
+        return "DailyForex"
+    return "Source"
 
-    return dom[:40] if dom else "مصدر"
-
-
-def parse_entry_time(entry: Any) -> datetime:
-    for key in ("published", "updated", "created"):
-        val = getattr(entry, key, None)
-        if val:
-            try:
-                dt = dtparser.parse(val)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt.astimezone(KUWAIT_TZ)
-            except Exception:
-                pass
-    return now_kw()
-
-
-# =========================
-# OPTIONAL TRANSLATION (EN->AR)
-# =========================
-_translator = None
-
-def translate_to_ar(text: str) -> str:
-    # Only if enabled
-    global _translator
-    if not TRANSLATE_EN:
-        return text
+def to_arabic(text: str) -> str:
+    """Translate any non-Arabic text to Arabic."""
+    text = clean(text)
+    if not text:
+        return ""
     try:
-        if _translator is None:
-            from deep_translator import GoogleTranslator
-            _translator = GoogleTranslator(source="auto", target="ar")
-        return _translator.translate(text)
+        return GoogleTranslator(source="auto", target="ar").translate(text)
     except Exception:
         return text
 
+def safe_html(text: str) -> str:
+    """Escape HTML to prevent Telegram parse errors."""
+    return html.escape(text or "")
 
-# =========================
-# CLASSIFY: strength + sentiment
-# =========================
-HIGH_KW = [
-    # Central banks & rates
-    "rate decision", "interest rate", "fomc", "fed", "powell", "ecb", "boe", "boj",
-    "قرار الفائدة", "سعر الفائدة", "الفيدرالي", "باول", "المركزي الأوروبي", "بنك إنجلترا", "بنك اليابان",
-    # Major data
-    "cpi", "inflation", "nfp", "jobs report", "unemployment", "gdp", "pmi",
-    "التضخم", "مؤشر أسعار المستهلك", "الوظائف", "البطالة", "الناتج المحلي", "مديري المشتريات",
-    # Risk / shocks
-    "breaking", "urgent", "intervention", "sanction", "war",
-    "عاجل", "تحذير", "تدخل", "عقوبات", "حرب",
+# -------------------------
+# ANALYSIS (Professional Tags)
+# -------------------------
+URGENT_KEYWORDS = [
+    "breaking", "flash", "urgent",
+    "fed", "powell", "rate decision", "interest rate",
+    "cpi", "inflation", "nfp", "jobs report",
+    "boj", "ecb", "bank of england",
+    "intervention", "sanctions", "war", "conflict",
+    "crash", "plunge", "surge",
+    "عاجل", "فلاش", "سريع",
+    "الفيدرالي", "باول", "رفع الفائدة", "خفض الفائدة",
+    "التضخم", "مؤشر أسعار", "الوظائف", "الرواتب",
+    "تدخل", "عقوبات", "حرب", "توتر",
+    "انهيار", "هبوط حاد", "ارتفاع قوي",
 ]
 
-MED_KW = [
-    "retail sales", "ppi", "consumer confidence", "housing", "minutes", "speech",
-    "مبيعات التجزئة", "أسعار المنتجين", "ثقة المستهلك", "الإسكان", "محضر", "خطاب", "تصريحات",
-    "gold", "xau", "oil", "brent", "wti",
-    "الذهب", "النفط",
-    "usd", "eur", "gbp", "jpy", "chf", "cad", "aud", "nzd",
-    "الدولار", "اليورو", "الإسترليني", "الين",
+GOLD_KEYWORDS = ["gold", "xau", "xauusd", "ذهب", "الذهب"]
+OIL_KEYWORDS = ["oil", "brent", "wti", "نفط", "النفط"]
+USD_KEYWORDS = ["usd", "dollar", "الدولار"]
+JPY_KEYWORDS = ["jpy", "yen", "الين"]
+EUR_KEYWORDS = ["eur", "euro", "اليورو"]
+GBP_KEYWORDS = ["gbp", "pound", "الجنيه"]
+
+POSITIVE_WORDS = [
+    "rise", "rises", "up", "gain", "gains", "surge", "strong", "bullish",
+    "improve", "improves", "optimism", "beats", "higher",
+    "يرتفع", "ارتفاع", "يصعد", "مكاسب", "قوي", "إيجابي", "تفاؤل", "أفضل", "أعلى",
+]
+NEGATIVE_WORDS = [
+    "fall", "falls", "down", "drop", "drops", "plunge", "weak", "bearish",
+    "worse", "risk", "recession", "concern", "lower",
+    "يهبط", "هبوط", "ينخفض", "خسائر", "ضعيف", "سلبي", "مخاطر", "ركود", "قلق", "أقل",
 ]
 
-POS_KW = ["يرتفع", "ارتفاع", "يصعد", "صعود", "مكاسب", "إيجابي", "قوي", "يتحسن", "قفز", "زيادة",
-          "rise", "up", "gains", "bullish", "beats", "strong"]
-NEG_KW = ["ينخفض", "انخفاض", "يهبط", "هبوط", "خسائر", "سلبي", "ضعيف", "يتراجع", "هبوط حاد", "تراجع",
-          "fall", "down", "losses", "bearish", "misses", "weak"]
+def is_urgent(raw_title: str, raw_summary: str) -> bool:
+    combined = (raw_title + " " + raw_summary).lower()
+    return any(k.lower() in combined for k in URGENT_KEYWORDS)
 
+def market_sentiment(raw_title: str, raw_summary: str) -> str:
+    combined = (raw_title + " " + raw_summary).lower()
+    pos = sum(1 for w in POSITIVE_WORDS if w.lower() in combined)
+    neg = sum(1 for w in NEGATIVE_WORDS if w.lower() in combined)
+    if pos > neg and pos >= 1:
+        return "إيجابي ✅"
+    if neg > pos and neg >= 1:
+        return "سلبي ⚠️"
+    return "محايد ⚪"
 
-def classify_strength(text: str) -> str:
-    t = (text or "").lower()
-    if any(k in t for k in HIGH_KW):
-        return "HIGH"
-    if any(k in t for k in MED_KW):
-        return "MED"
-    return "LOW"
+def news_strength(raw_title: str, raw_summary: str, urgent: bool) -> str:
+    combined = (raw_title + " " + raw_summary).lower()
+    score = 0
+    if urgent:
+        score += 3
+    for k in ["fed", "fomc", "powell", "cpi", "inflation", "nfp", "rate",
+              "الفيدرالي", "باول", "التضخم", "الوظائف", "الفائدة"]:
+        if k.lower() in combined:
+            score += 2
 
+    if score >= 5:
+        return "عالي جداً ⚡"
+    if score >= 3:
+        return "عالي 🔥"
+    if score >= 1:
+        return "متوسط ✨"
+    return "منخفض"
 
-def classify_sentiment(text: str) -> str:
-    t = (text or "").lower()
-    p = sum(1 for k in POS_KW if k in t)
-    n = sum(1 for k in NEG_KW if k in t)
-    if p > n and p > 0:
-        return "إيجابي"
-    if n > p and n > 0:
-        return "سلبي"
-    return "محايد"
+def affected_assets(raw_title: str, raw_summary: str) -> str:
+    combined = (raw_title + " " + raw_summary).lower()
+    assets = []
+    if any(k in combined for k in GOLD_KEYWORDS):
+        assets.append("الذهب (XAUUSD)")
+    if any(k in combined for k in OIL_KEYWORDS):
+        assets.append("النفط")
+    if any(k in combined for k in USD_KEYWORDS):
+        assets.append("الدولار (USD)")
+    if any(k in combined for k in JPY_KEYWORDS):
+        assets.append("الين (JPY)")
+    if any(k in combined for k in EUR_KEYWORDS):
+        assets.append("اليورو (EUR)")
+    if any(k in combined for k in GBP_KEYWORDS):
+        assets.append("الجنيه (GBP)")
+    return "، ".join(dict.fromkeys(assets)) if assets else "الأسواق / العملات"
 
-
-def strength_label(strength: str) -> str:
-    if strength == "HIGH":
-        return "عالي جداً 🔥"
-    if strength == "MED":
-        return "متوسط ⚡"
-    return "منخفض ✨"
-
-
-def sentiment_badge(sentiment: str) -> str:
-    if sentiment == "إيجابي":
-        return "🟢 <b>إيجابي</b>"
-    if sentiment == "سلبي":
-        return "🔴 <b>سلبي</b>"
-    return "⚪️ <b>محايد</b>"
-
-
-# =========================
-# STATE (dedupe)
-# =========================
-def load_state() -> Dict[str, Any]:
-    if not os.path.exists(STATE_FILE):
-        return {"sent": {}, "alerts": {}}
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"sent": {}, "alerts": {}}
-
-
-def save_state(state: Dict[str, Any]) -> None:
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning("Failed saving state: %s", e)
-
-
-def is_sent(state: Dict[str, Any], item_id: str) -> bool:
-    return item_id in state.get("sent", {})
-
-
-def mark_sent(state: Dict[str, Any], item_id: str) -> None:
-    state.setdefault("sent", {})[item_id] = int(time.time())
-
+def golden_warning_flag(raw_title: str, raw_summary: str) -> str:
+    combined = (raw_title + " " + raw_summary).lower()
+    if any(k in combined for k in GOLD_KEYWORDS):
+        return "🟡 <b>تنبيه الذهب</b>: قد يؤثر على الذهب (XAUUSD)"
+    return ""
 
 # =========================
-# EVENTS ALERTS (optional)
+# MESSAGE BUILDER (Clean Format)
 # =========================
-def load_events() -> List[Dict[str, Any]]:
-    if not os.path.exists(EVENTS_FILE):
-        return []
-    try:
-        with open(EVENTS_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        out = []
-        for ev in raw:
-            dt = dtparser.parse(ev["datetime"])
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=KUWAIT_TZ)
-            out.append({
-                "id": ev.get("id") or short_hash(ev.get("title", ""), ev.get("datetime", "")),
-                "title": clean(ev.get("title", "")),
-                "currency": clean(ev.get("currency", "")).upper(),
-                "country": clean(ev.get("country", "")),
-                "dt": dt.astimezone(KUWAIT_TZ),
-                "impact": (ev.get("impact") or "").lower(),
-                "source": clean(ev.get("source") or "Economic Calendar"),
-            })
-        return out
-    except Exception as e:
-        logger.warning("Failed reading events.json: %s", e)
-        return []
+def build_message(
+    title_ar: str,
+    summary_ar: str,
+    link: str,
+    src: str,
+    urgent: bool,
+    strength_ar: str,
+    sentiment_ar: str,
+    assets_ar: str,
+    golden_warning: str
+) -> str:
+    title_ar = safe_html(clean(title_ar))
+    summary_ar = safe_html(clean(summary_ar))
+    link = clean(link)
 
+    if summary_ar:
+        summary_ar = summary_ar[:SUMMARY_MAX_CHARS] + ("..." if len(summary_ar) > SUMMARY_MAX_CHARS else "")
 
-def is_high_impact_event(ev: Dict[str, Any]) -> bool:
-    return ev.get("impact") in ("high", "strong", "عالي")
+    header = "🚨 <b>عاجل</b>\n" if urgent else "📰 <b>خبر اقتصادي</b>\n"
+    now_kw = datetime.now(KUWAIT_TZ).strftime("%Y-%m-%d %H:%M")
 
+    msg = f"{header}<b>{title_ar}</b>\n"
 
-def set_alert_sent(state: Dict[str, Any], alert_id: str) -> None:
-    state.setdefault("alerts", {})[alert_id] = int(time.time())
+    if summary_ar:
+        msg += f"\n{summary_ar}\n"
 
-
-def is_alert_sent(state: Dict[str, Any], alert_id: str) -> bool:
-    return alert_id in state.get("alerts", {})
-
-
-def build_event_alert(ev: Dict[str, Any], minutes_before: int) -> str:
-    header = "⚠️ <b>تنبيه خبر قوي بعد 30 دقيقة</b>" if minutes_before == 30 else "🔥 <b>خبر قوي بعد 5 دقائق!</b>"
-    msg = (
-        f"{header}\n\n"
-        f"📌 <b>{ev['title']}</b>\n"
-        f"💱 <b>العملة:</b> {ev['currency']}\n"
-        f"🕒 <b>وقت الخبر:</b> {fmt_dt(ev['dt'])}\n"
-        f"📰 <b>المصدر:</b> {ev['source']}\n\n"
-        f"— @news_forexq"
-    )
-    return msg
-
-
-# =========================
-# TELEGRAM SENDER (Flood-safe queue)
-# =========================
-class Sender:
-    def __init__(self, bot: Bot, channel_id: str, delay: float):
-        self.bot = bot
-        self.channel_id = channel_id
-        self.delay = delay
-        self.q: asyncio.Queue[str] = asyncio.Queue()
-        self.task: Optional[asyncio.Task] = None
-
-    async def start(self):
-        if self.task is None:
-            self.task = asyncio.create_task(self.worker())
-
-    async def enqueue(self, text: str):
-        await self.q.put(text)
-
-    async def worker(self):
-        while True:
-            text = await self.q.get()
-            try:
-                await self.send_with_retry(text)
-            finally:
-                await asyncio.sleep(self.delay)
-                self.q.task_done()
-
-    async def send_with_retry(self, text: str):
-        for _ in range(8):
-            try:
-                await self.bot.send_message(
-                    chat_id=self.channel_id,
-                    text=text,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-                return
-            except RetryAfter as e:
-                wait = int(getattr(e, "retry_after", 5)) + 1
-                logger.warning("Flood control: wait %ss", wait)
-                await asyncio.sleep(wait)
-            except (TimedOut, NetworkError):
-                await asyncio.sleep(3)
-            except Exception as ex:
-                logger.error("Send failed: %s", ex)
-                await asyncio.sleep(2)
-
-
-# =========================
-# MESSAGE TEMPLATE (احترافي مرتب)
-# =========================
-def build_news_message(title: str, summary: str, src: str, strength: str, sentiment: str, when_dt: datetime) -> str:
-    title = clean(title)
-    summary = clean(summary)
-
-    # summary مختصر ونظيف
-    if summary:
-        if summary.startswith(title):
-            summary = summary[len(title):].strip()
-        if len(summary) > 520:
-            summary = summary[:520].rstrip() + "..."
-
-    badge = sentiment_badge(sentiment)
-    power = strength_label(strength)
-
-    star = "⭐ <b>خبر مميز اليوم</b>\n\n" if strength == "HIGH" else ""
-
-    msg = (
-        f"{star}"
-        f"{badge}\n\n"
-        f"🔔🌐 <b>صدر الآن</b> ‼️\n\n"
-        f"📌 <b>{title}</b>\n\n"
-    )
-
-    if summary:
-        msg += f"📝 <b>ملخص الخبر:</b>\n{summary}\n\n"
+    if golden_warning:
+        msg += f"\n{golden_warning}\n"
 
     msg += (
-        "━━━━━━━━━━━━━━\n"
-        f"⚡ <b>قوة الخبر:</b> {power}\n"
-        f"🧠 <b>اتجاه السوق:</b> {sentiment}\n\n"
-        f"🕒 <b>{fmt_dt(when_dt)}</b>\n"
-        f"📰 <b>المصدر:</b> {src}\n\n"
-        f"— @news_forexq"
+        "\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>قوة الخبر</b>: {safe_html(strength_ar)}\n"
+        f"🧠 <b>اتجاه السوق</b>: {safe_html(sentiment_ar)}\n"
+        f"📌 <b>الأصول المتأثرة</b>: {safe_html(assets_ar)}\n"
+        f"🕒 <b>الوقت</b>: {safe_html(now_kw)} (الكويت)\n"
+        f"🔗 <b>المصدر</b> ({safe_html(src)}):\n{safe_html(link)}\n"
+        "━━━━━━━━━━━━━━━━━━━━"
     )
 
-    # ضمان نهائي: ما فيه روابط
-    return strip_links(msg)
-
+    msg += SIGNATURE
+    return msg
 
 # =========================
-# RSS FETCH
+# SAFE SEND (Handle Flood/Timeout)
 # =========================
-async def fetch_items() -> List[Dict[str, Any]]:
-    items: List[Dict[str, Any]] = []
-    for url in RSS_FEEDS:
+async def safe_send(bot: Bot, text: str) -> None:
+    while True:
         try:
-            d = feedparser.parse(url)
-            for e in getattr(d, "entries", [])[:40]:
-                title = clean(getattr(e, "title", "") or "")
-                summary = clean(getattr(e, "summary", "") or getattr(e, "description", "") or "")
-                pub_dt = parse_entry_time(e)
-                src = source_name(e, url)
-
-                if not title:
-                    continue
-
-                # عربي فقط + خيار ترجمة
-                all_text = f"{title} {summary}"
-                if ARABIC_ONLY and not has_arabic(all_text):
-                    if TRANSLATE_EN:
-                        title = translate_to_ar(title)
-                        summary = translate_to_ar(summary)
-                        if ARABIC_ONLY and not has_arabic(f"{title} {summary}"):
-                            continue
-                    else:
-                        continue
-
-                strength = classify_strength(all_text)
-                sentiment = classify_sentiment(all_text)
-
-                # ✅ المطلوب: أخبار اقتصادية عامة (HIGH + MED) فقط
-                if strength not in ("HIGH", "MED"):
-                    continue
-
-                item_id = short_hash(src, title, str(pub_dt))
-                items.append({
-                    "id": item_id,
-                    "title": title,
-                    "summary": summary,
-                    "src": src,
-                    "published": pub_dt,
-                    "strength": strength,
-                    "sentiment": sentiment,
-                })
-
-        except Exception as ex:
-            logger.warning("RSS fetch failed for %s: %s", url, ex)
-
-    # newest first
-    items.sort(key=lambda x: x["published"], reverse=True)
-    return items
-
+            await bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=False
+            )
+            return
+        except RetryAfter as e:
+            wait_s = int(getattr(e, "retry_after", 5))
+            print(f"RetryAfter: sleeping {wait_s}s")
+            await asyncio.sleep(wait_s)
+        except (TimedOut, NetworkError) as e:
+            print("Network/Timeout:", e)
+            await asyncio.sleep(5)
+        except Exception as e:
+            print("Send error:", e)
+            # إذا صار خطأ غير متوقع، نطلع عشان ما نعلق للأبد
+            return
 
 # =========================
 # MAIN LOOP
 # =========================
-async def run():
-    if not BOT_TOKEN or not CHANNEL_ID:
-        raise RuntimeError("Missing BOT_TOKEN or CHANNEL_ID in environment variables.")
-    if not RSS_FEEDS:
-        raise RuntimeError("Missing RSS_FEEDS env var (comma-separated).")
+async def run() -> None:
+    init_db()
+    bot = Bot(token=TOKEN)
 
-    bot = Bot(token=BOT_TOKEN)
-    sender = Sender(bot, CHANNEL_ID, delay=SEND_DELAY_SECONDS)
-    await sender.start()
-
-    state = load_state()
-    logger.info("Bot Running...")
+    print("Bot Running...")
+    print("Channel:", CHANNEL_ID)
+    print("Feeds:", FEEDS)
 
     while True:
         try:
-            # 1) Calendar alerts (optional) — if you keep events.json
-            events = load_events()
-            now_dt = now_kw()
+            for url in FEEDS:
+                feed = feedparser.parse(url)
+                src = source_label(url)
 
-            for ev in events:
-                if not is_high_impact_event(ev):
-                    continue
+                for entry in feed.entries[:MAX_PER_FEED]:
+                    raw_title = clean(entry.get("title", ""))
+                    link = clean(entry.get("link", ""))
+                    raw_summary = clean(entry.get("summary") or entry.get("description") or "")
 
-                alert30 = f"{ev['id']}_30"
-                alert5 = f"{ev['id']}_5"
+                    if not raw_title and not link:
+                        continue
 
-                if (ev["dt"] - timedelta(minutes=30)) <= now_dt < ev["dt"] and not is_alert_sent(state, alert30):
-                    # window 1 minute
-                    if now_dt <= (ev["dt"] - timedelta(minutes=29, seconds=0)):
-                        await sender.enqueue(build_event_alert(ev, 30))
-                        set_alert_sent(state, alert30)
-                        save_state(state)
+                    item_id = entry.get("id") or make_hash_id(raw_title, link)
+                    if already_posted(item_id):
+                        continue
 
-                if (ev["dt"] - timedelta(minutes=5)) <= now_dt < ev["dt"] and not is_alert_sent(state, alert5):
-                    if now_dt <= (ev["dt"] - timedelta(minutes=4, seconds=0)):
-                        await sender.enqueue(build_event_alert(ev, 5))
-                        set_alert_sent(state, alert5)
-                        save_state(state)
+                    urgent = is_urgent(raw_title, raw_summary)
 
-            # 2) Economic news RSS (HIGH + MED)
-            items = await fetch_items()
+                    # Translate to Arabic
+                    title_ar = to_arabic(raw_title)
+                    summary_ar = to_arabic(raw_summary)
 
-            # prevent flooding: post up to 6 per cycle
-            posted = 0
-            for it in items:
-                if posted >= 6:
-                    break
-                if is_sent(state, it["id"]):
-                    continue
+                    sentiment_ar = market_sentiment(raw_title, raw_summary)
+                    strength_ar = news_strength(raw_title, raw_summary, urgent)
+                    assets_ar = affected_assets(raw_title, raw_summary)
+                    golden_warning = golden_warning_flag(raw_title, raw_summary)
 
-                msg = build_news_message(
-                    title=it["title"],
-                    summary=it["summary"],
-                    src=it["src"],
-                    strength=it["strength"],
-                    sentiment=it["sentiment"],
-                    when_dt=it["published"],
-                )
+                    text = build_message(
+                        title_ar=title_ar,
+                        summary_ar=summary_ar,
+                        link=link,
+                        src=src,
+                        urgent=urgent,
+                        strength_ar=strength_ar,
+                        sentiment_ar=sentiment_ar,
+                        assets_ar=assets_ar,
+                        golden_warning=golden_warning
+                    )
 
-                await sender.enqueue(msg)
+                    await safe_send(bot, text)
+                    mark_posted(item_id)
 
-                mark_sent(state, it["id"])
-                save_state(state)
-                posted += 1
+                    # تهدئة بسيطة عشان ما يصير Flood
+                    await asyncio.sleep(1.5)
 
             await asyncio.sleep(POLL_SECONDS)
 
         except Exception as ex:
-            logger.exception("Loop error: %s", ex)
-            await asyncio.sleep(5)
-
+            print("Loop Error:", ex)
+            await asyncio.sleep(10)
 
 if __name__ == "__main__":
     asyncio.run(run())
