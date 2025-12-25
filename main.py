@@ -4,33 +4,47 @@ import sqlite3
 import hashlib
 import asyncio
 from datetime import datetime, timezone, timedelta
+import html
 
 import feedparser
 from deep_translator import GoogleTranslator
 from telegram import Bot
 from telegram.constants import ParseMode
+from telegram.error import RetryAfter, TimedOut, NetworkError
 
 # =========================
-# CONFIG
+# CONFIG (Railway Env Vars)
 # =========================
 TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
-    raise Exception("BOT_TOKEN missing in environment variables")
+    raise RuntimeError("Missing BOT_TOKEN in environment variables.")
 
-CHANNEL = "@news_forexq"
-SIGNATURE = "\n\n— @news_forexq"
+CHANNEL_ID = os.environ.get("CHANNEL_ID") or os.environ.get("CHANNEL")
+if not CHANNEL_ID:
+    raise RuntimeError("Missing CHANNEL_ID (or CHANNEL) in environment variables.")
 
-FEEDS = [
+SIGNATURE = os.environ.get("SIGNATURE", "\n\n— @news_forexq")
+
+DEFAULT_FEEDS = [
     "https://www.investing.com/rss/news_1.rss",
     "https://ar.fxstreet.com/rss/news",
     "https://www.arabictrader.com/rss/news",
     "https://arab.dailyforex.com/rss/arab/forexnews.xml",
 ]
+RSS_FEEDS_ENV = (os.environ.get("RSS_FEEDS") or "").strip()
+FEEDS = [f.strip() for f in RSS_FEEDS_ENV.split(",") if f.strip()] if RSS_FEEDS_ENV else DEFAULT_FEEDS
 
-POLL_SECONDS = 25
-MAX_PER_FEED = 25
-SUMMARY_MAX_CHARS = 320
-DB_FILE = "posted.db"
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
+MAX_PER_FEED = int(os.environ.get("MAX_PER_FEED", "25"))
+SUMMARY_MAX_CHARS = int(os.environ.get("SUMMARY_MAX_CHARS", "320"))
+DB_FILE = os.environ.get("DB_FILE", "posted.db")
+KUWAIT_TZ = timezone(timedelta(hours=3))
+
+CTA_FOOTER = (
+    "\n\n🌟 اذا استفدت من هذا المحتوى فإن المتابعة و النشر يساعدنا كثيراً\n"
+    "أخبار الفوركس | Forex News\n"
+    "https://t.me/news_forexq"
+)
 
 # =========================
 # DATABASE
@@ -38,7 +52,7 @@ DB_FILE = "posted.db"
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS posted (id TEXT PRIMARY KEY, created_at TEXT)""")
+    cur.execute("CREATE TABLE IF NOT EXISTS posted (id TEXT PRIMARY KEY, created_at TEXT)")
     conn.commit()
     conn.close()
 
@@ -61,12 +75,10 @@ def mark_posted(i):
 # HELPERS
 # =========================
 def clean(t): return " ".join((t or "").replace("\n"," ").split())
-
-def make_hash_id(t,l):
-    return hashlib.sha256((clean(t)+clean(l)).encode()).hexdigest()
+def make_hash_id(t,l): return hashlib.sha256((clean(t)+clean(l)).encode()).hexdigest()
 
 def source_label(u):
-    u=u.lower()
+    u=(u or "").lower()
     if "investing" in u: return "Investing"
     if "fxstreet" in u: return "FXStreet"
     if "arabictrader" in u: return "ArabicTrader"
@@ -77,6 +89,8 @@ def to_ar(t):
     try: return GoogleTranslator(source="auto", target="ar").translate(clean(t))
     except: return clean(t)
 
+def safe_html(t): return html.escape(t or "")
+
 # =========================
 # ANALYSIS
 # =========================
@@ -85,46 +99,40 @@ POS = ["rise","gain","bullish","ارتفاع","مكاسب","إيجابي"]
 NEG = ["fall","drop","bearish","هبوط","سلبي","مخاطر"]
 GOLD = ["gold","xau","ذهب"]
 
-def is_urgent(t,s):
-    c=(t+s).lower()
-    return any(k in c for k in URGENT)
-
+def is_urgent(t,s): return any(k in (t+s).lower() for k in URGENT)
 def sentiment(t,s):
     c=(t+s).lower()
-    p=sum(k in c for k in POS)
-    n=sum(k in c for k in NEG)
-    if p>n: return "إيجابي"
-    if n>p: return "سلبي"
+    if sum(k in c for k in POS)>sum(k in c for k in NEG): return "إيجابي"
+    if sum(k in c for k in NEG)>sum(k in c for k in POS): return "سلبي"
     return "محايد"
-
-def strength(t,s,u):
-    score = 3 if u else 1
-    return "عالي" if score>2 else "متوسط"
-
-def assets(t,s):
-    return "الذهب" if any(k in (t+s).lower() for k in GOLD) else "العملات"
+def strength(t,s,u): return "عالي" if u else "متوسط"
+def assets(t,s): return "الذهب" if any(k in (t+s).lower() for k in GOLD) else "العملات"
 
 # =========================
-# MESSAGE
+# MESSAGE BUILDER (FINAL TEMPLATE)
 # =========================
 def build(title, summary, src, urgent, strength_ar, sentiment_ar, assets_ar):
-    head = "🚨 <b>عاجل</b>\n" if urgent else "📰 "
-    return (
-        f"{head}<b>{title}</b>\n\n{summary[:SUMMARY_MAX_CHARS]}"
-        "\n━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 قوة الخبر: {strength_ar}\n"
-        f"🧠 اتجاه السوق: {sentiment_ar}\n"
-        f"📌 الأصول المتأثرة: {assets_ar}\n"
-        f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-        f"🔗 المصدر: {src}\n"
+    title = safe_html(title)
+    summary = safe_html(summary[:SUMMARY_MAX_CHARS])
+    head = "🚨 عاجل\n" if urgent else "📰 خبر اقتصادي\n"
+
+    msg = (
+        f"{head}📉 {title}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚡ قوة الخبر : {strength_ar}\n"
+        f"🧠 اتجاه السوق : {sentiment_ar}\n"
+        f"💱 الأصول المتأثرة : {assets_ar}\n"
+        f"🕒 الوقت : {datetime.now(KUWAIT_TZ).strftime('%Y-%m-%d | %H:%M')} (الكويت)\n"
+        f"📰 المصدر : {src}\n"
         "━━━━━━━━━━━━━━━━━━━━"
-        + SIGNATURE
+        f"{CTA_FOOTER}"
     )
+    return msg
 
 # =========================
 # MAIN LOOP
 # =========================
-async def main():
+async def run():
     init_db()
     bot = Bot(token=TOKEN)
     while True:
@@ -140,20 +148,12 @@ async def main():
 
                 t_ar = to_ar(t)
                 s_ar = to_ar(s)
-
                 u = is_urgent(t,s)
-                text = build(
-                    t_ar,
-                    s_ar,
-                    src,
-                    u,
-                    strength(t,s,u),
-                    sentiment(t,s),
-                    assets(t,s)
-                )
-                await bot.send_message(chat_id=CHANNEL, text=text, parse_mode=ParseMode.HTML)
+                msg = build(t_ar, s_ar, src, u, strength(t,s,u), sentiment(t,s), assets(t,s))
+                await bot.send_message(chat_id=CHANNEL_ID, text=msg, parse_mode=ParseMode.HTML)
                 mark_posted(hid)
                 await asyncio.sleep(1.5)
         await asyncio.sleep(POLL_SECONDS)
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(run())
