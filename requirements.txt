@@ -1,5 +1,4 @@
-python-telegram-bot==20.7
-feedparser
-requests
-beautifulsoup4
-pytz
+python-telegram-bot==21.6
+feedparser==6.0.11
+python-dateutil==2.9.0.post0
+deep-translator==1.11.4
