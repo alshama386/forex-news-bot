@@ -17,11 +17,13 @@ TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise Exception("BOT_TOKEN missing in environment variables (set BOT_TOKEN)")
 
+# تقدر تخليها متغير بيئة لو تحب:
+# CHANNEL = os.environ.get("CHANNEL_ID", "@news_forexq")
 CHANNEL = "@news_forexq"
 
-# توقيع + دعوة متابعة (حسب طلبك)
 SIGNATURE = "\n\n— @news_forexq"
-FOLLOW_CTA = (
+
+FOLLOW_FOOTER = (
     "\n\n🌟 اذا استفدت من هذا المحتوى فإن المتابعة و النشر يساعدنا كثيراً\n"
     "أخبار الفوركس forex news\n"
     "https://t.me/news_forexq"
@@ -107,31 +109,51 @@ def to_arabic(text: str) -> str:
         return text
 
 # =========================
-# BLOCKLIST (Israel news)
+# FILTER: Remove Israel ECONOMIC only (keep war/politics)
 # =========================
-BLOCK_KEYWORDS = [
+ISRAEL_ECON_WORDS = [
+    "israel","israeli",
+    "tel aviv","jerusalem",
+    "تل ابيب","تل أبيب","القدس",
+    "بنك اسرائيل","بنك إسرائيل",
+    "shekel","ils","₪","الشيكل","شيكل",
+    "tase","ta-35","israel bonds",
+    "israel economy","economic israel",
+    "اقتصاد اسرائيل","الاقتصاد الاسرائيلي","الاقتصاد الإسرائيلي"
+]
+
+ECONOMIC_WORDS = [
     # EN
-    "israel", "israeli", "tel aviv", "jerusalem", "gaza", "netanyahu",
-    "israel economy", "israel economic", "bank of israel",
-    "shekel", "ils", "₪", "ta-35", "tase", "israel bonds",
+    "rate","interest","inflation","cpi","gdp","jobs","nfp","unemployment",
+    "central bank","bond","bonds","stocks","stock","market","index","yield",
+    "currency","fx","forex",
     # AR
-    "اسرائيل", "إسرائيل", "الاسرائيلي", "الإسرائيلي",
-    "تل ابيب", "تل أبيب", "القدس",
-    "غزة", "نتنياهو",
-    "بنك اسرائيل", "بنك إسرائيل",
-    "الشيكل", "شيكل",
+    "الفائدة","رفع الفائدة","خفض الفائدة","التضخم","مؤشر أسعار","الناتج","الناتج المحلي",
+    "الوظائف","الرواتب","البطالة","البنك المركزي","سندات","أسهم","سوق","مؤشر","عائد",
+    "عملة","فوركس"
+]
+
+# كلمات سياسية/حرب نستخدمها كـ "استثناء" (حتى لو فيه اقتصاد، نخلي الخبر يمر إذا واضح أنه سياسي/حرب)
+WAR_POLITICS_WORDS = [
+    "war","strike","airstrike","attack","missile","rocket","ceasefire","truce",
+    "conflict","tension","escalation","sanctions","diplomacy","talks",
+    "حرب","قصف","غارة","هجوم","صاروخ","هدنة","وقف إطلاق النار",
+    "صراع","توتر","تصعيد","عقوبات","محادثات","دبلوماسية","سياسي","سياسة"
 ]
 
 def should_block_news(raw_title: str, raw_summary: str, link: str) -> bool:
     combined = (raw_title + " " + raw_summary + " " + (link or "")).lower()
-    for k in BLOCK_KEYWORDS:
-        if k.lower() in combined:
-            return True
-    return False
 
-# -------------------------
+    has_israel = any(k in combined for k in ISRAEL_ECON_WORDS)
+    has_econ = any(k in combined for k in ECONOMIC_WORDS)
+    has_war_pol = any(k in combined for k in WAR_POLITICS_WORDS)
+
+    # ❌ امنع فقط: إسرائيل + اقتصادي  (لكن إذا واضح حرب/سياسة، خله يمر)
+    return (has_israel and has_econ and not has_war_pol)
+
+# =========================
 # ANALYSIS (Professional Tags)
-# -------------------------
+# =========================
 URGENT_KEYWORDS = [
     # EN
     "breaking", "flash", "urgent",
@@ -232,8 +254,7 @@ def golden_warning_flag(raw_title: str, raw_summary: str) -> str:
     return ""
 
 # =========================
-# MESSAGE BUILDER (Nice Template)
-# - بدون رابط (حسب طلبك)
+# MESSAGE BUILDER (No Link, Source only)
 # =========================
 def build_message(
     title_ar: str,
@@ -266,17 +287,17 @@ def build_message(
         f"📊 <b>قوة الخبر</b>: {strength_ar}\n"
         f"🧠 <b>اتجاه السوق</b>: {sentiment_ar}\n"
         f"📌 <b>الأصول المتأثرة</b>: {assets_ar}\n"
-        f"🕒 {kuwait_time} (الكويت)\n"
+        f"🕒 <b>الوقت</b>: {kuwait_time} (الكويت)\n"
         f"🔗 <b>المصدر</b>: {src}\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
 
     msg += SIGNATURE
-    msg += FOLLOW_CTA
+    msg += FOLLOW_FOOTER
     return msg
 
 # =========================
-# MAIN LOOP (Async)
+# MAIN LOOP
 # =========================
 async def main() -> None:
     init_db()
@@ -296,7 +317,7 @@ async def main() -> None:
                     if not raw_title and not link:
                         continue
 
-                    # ✅ فلترة أخبار إسرائيل (قبل أي شيء)
+                    # ✅ فلترة: شيل أخبار إسرائيل الاقتصادية فقط
                     if should_block_news(raw_title, raw_summary, link):
                         continue
 
@@ -306,11 +327,10 @@ async def main() -> None:
 
                     urgent = is_urgent(raw_title, raw_summary)
 
-                    # ترجمة عربي
+                    # Translate to Arabic
                     title_ar = to_arabic(raw_title)
                     summary_ar = to_arabic(raw_summary)
 
-                    # التحليل
                     sentiment_ar = market_sentiment(raw_title, raw_summary)
                     strength_ar = news_strength(raw_title, raw_summary, urgent)
                     assets_ar = affected_assets(raw_title, raw_summary)
@@ -331,7 +351,7 @@ async def main() -> None:
                         chat_id=CHANNEL,
                         text=text,
                         parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True  # عشان ما يطلع كرت الرابط
+                        disable_web_page_preview=True  # لأن ماكو رابط، وخليها True عشان ما يطلع preview مزعج
                     )
 
                     mark_posted(item_id)
